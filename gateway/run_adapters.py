@@ -884,6 +884,8 @@ class GatewayAdapterLifecycleMixin:
             self._schedule_resume_pending_sessions(platform=platform)
         except Exception:
             logger.debug("resume-pending reschedule after %s reconnect failed", platform.value, exc_info=True)
+        if getattr(adapter, "durable_intake", False) is True:
+            await self._drain_durable_intakes(adapter=adapter)
 
     async def _cancel_secondary_profile_reconnect_tasks(self) -> None:
         """Cancel profile-scoped reconnects before tearing down their registry, so a reconnect
@@ -1289,6 +1291,12 @@ class GatewayAdapterLifecycleMixin:
         adapter.set_fatal_error_handler(fatal_error_handler or self._handle_adapter_fatal_error)
         adapter.set_session_store(self.session_store)
         adapter.set_busy_session_handler(busy_session_handler or self._primary_busy_session_handler())
+        if getattr(adapter, "durable_intake", False) is True:
+            async def drain(session_key):
+                if not getattr(self, "_draining", False):
+                    await self._drain_durable_intakes(adapter=adapter, session_key=session_key, unclaimed_only=True)
+            adapter.set_durable_intake_handler(self._make_durable_intake_handler(adapter),
+                                               finish=self._finish_durable_intake_handoff, drain=drain)
         _set_reaction = getattr(adapter, "set_reaction_handler", None)
         if callable(_set_reaction):
             _set_reaction(self._handle_reaction_event)
@@ -1423,6 +1431,8 @@ class GatewayAdapterLifecycleMixin:
                             except Exception:
                                 logger.debug("resume-pending reschedule after %s reconnect failed (profile: %s)",
                                              platform.value, profile_name, exc_info=True)
+                            if getattr(adapter, "durable_intake", False) is True:
+                                await self._drain_durable_intakes(adapter=adapter)
                             return
                     # Not installed (newer reconnect won the slot, shutdown began, or connect failed):
                     # release partial resources; stop only for a non-retryable fatal.

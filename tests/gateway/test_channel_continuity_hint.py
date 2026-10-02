@@ -10,6 +10,7 @@ Covers:
 """
 
 from datetime import datetime, timedelta
+from types import SimpleNamespace
 
 import pytest
 
@@ -87,6 +88,13 @@ def _reset_entry(platform, prev="20260101_000000_abc", had_activity=True):
 
 
 class TestBuildChannelContinuityNote:
+    def test_inline_reset_recalls_only_its_own_predecessor(self):
+        source = SimpleNamespace(platform=SimpleNamespace(value="inline"), thread_id=None)
+        entry = _reset_entry(Platform.SLACK, prev="inline-own-predecessor")
+        assert "inline-own-predecessor" in build_channel_continuity_note(entry, source)
+        entry.reset_had_activity = False
+        assert build_channel_continuity_note(entry, source) is None
+
     def test_slack_channel_emits_hint(self):
         entry = _reset_entry(Platform.SLACK)
         note = build_channel_continuity_note(entry, _slack_source())

@@ -98,6 +98,9 @@ class SessionSource:
     # over the authenticated relay WebSocket. ``platform`` is the UNDERLYING platform, not
     # ``relay``, so authz must key upstream trust off THIS flag.
     delivered_via_upstream_relay: bool = False
+    # Live native sender-directory proof, never imported from to_dict/from_dict.
+    # False means unknown, even when is_bot has its ordinary default False.
+    author_kind_verified: bool = field(default=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
         # Mirror scope_id/guild_id onto each other (scope_id wins) so readers of EITHER agree.
@@ -619,13 +622,13 @@ class SessionEntry:
 
 
 def build_channel_continuity_note(entry: "SessionEntry", source: SessionSource) -> Optional[str]:
-    """One-line continuity hint for long-lived Slack/Discord channels/threads.
+    """One-line continuity hint for long-lived Slack/Discord/Inline conversations.
 
     After an auto-reset the agent could bind a new request to an unrelated recent session; this
     points it at the prior session in *this* channel (via ``session_search``). ``None`` unless the
-    platform is Slack/Discord, the auto-reset had real activity, and prev_session_id is set.
+    platform is Slack/Discord/Inline, the auto-reset had real activity, and prev_session_id is set.
     """
-    if source.platform not in (Platform.SLACK, Platform.DISCORD):
+    if getattr(source.platform, "value", source.platform) not in ("slack", "discord", "inline"):
         return None
     prev = entry.prev_session_id
     if not entry.reset_had_activity or not prev:
@@ -1120,12 +1123,24 @@ class SessionStore(
             entry = self._entry_locked(session_key)
             return dict(entry.model_override) if entry and entry.model_override else None
 
-    def reset_session(self, session_key: str, display_name: Optional[str] = None) -> Optional[SessionEntry]:
+    def reset_session(self, session_key: str, display_name: Optional[str] = None,
+                      public_context_boundary: Optional[dict] = None) -> Optional[SessionEntry]:
         """Force reset a session, creating a new session ID."""
+        if public_context_boundary is not None:
+            with self._lock:
+                reset_entry = self._entry_locked(session_key)
+            # The boundary survives cold /new and routing-index loss. A failed
+            # write must not publish a route that reimports deliberately reset history.
+            source_value = public_context_boundary.get("source") or (
+                reset_entry.platform.value if reset_entry and reset_entry.platform else None)
+            self._db_for_key(session_key).reset_public_context_route(
+                source_value, session_key, public_context_boundary)
         with self._lock:
             old_entry = self._entry_locked(session_key)
             if old_entry is None:
                 return None
+            if public_context_boundary is not None and (reset_entry is None or old_entry.session_id != reset_entry.session_id):
+                raise RuntimeError("session route changed during reset")
             now = _now()
             session_id = _new_session_id(now)
             new_entry = self._replace_route_locked(

@@ -151,6 +151,9 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
         # first-send. Used by the fresh-final logic to detect long-lived previews whose edit timestamps
         # would be stale by completion time. Ported from openclaw/openclaw#72038.
         self._preview_message_ids: "set[str]" = set()
+        # Independent from preview cleanup/segment rotation: every confirmed
+        # physical send remains attributable to this turn.
+        self._delivered_message_ids: "set[str]" = set()
         self._already_sent = False
         self._edit_supported = True  # False once progressive edits stop working
         self._last_edit_time = 0.0
@@ -270,6 +273,25 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
     already_sent = property(lambda self: self._already_sent)
     final_response_sent = property(lambda self: self._final_response_sent)
     message_id = property(lambda self: self._message_id)
+
+    @property
+    def delivered_message_ids(self):
+        """Physical messages to verify after streaming, including split previews.
+
+        Adapters fetch these identities to distinguish persisted output from
+        ephemeral draft frames; absent/deleted frames produce no receipt.
+        """
+        return tuple(sorted(self._delivered_message_ids))
+
+    def _track_delivered_result(self, result):
+        if not getattr(result, "success", False):
+            return
+        raw = getattr(result, "raw_response", None) or {}
+        ids = raw.get("message_ids") if isinstance(raw, dict) else ()
+        for mid in (getattr(result, "message_id", None),
+                    *(getattr(result, "continuation_message_ids", None) or ()), *(ids or ())):
+            if mid and str(mid) != "__no_edit__":
+                self._delivered_message_ids.add(str(mid))
     final_content_delivered = property(lambda self: self._final_content_delivered)
 
     async def _notify_before_finalize(self) -> None:
@@ -515,7 +537,9 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
                        "falling back to send() for pre-prompt text (chat=%s)",
                        _reason, self.chat_id)
         try:
-            if getattr(await self.adapter.send(self.chat_id, finalize_text), "success", False):
+            result = await self.adapter.send(self.chat_id, finalize_text)
+            self._track_delivered_result(result)
+            if getattr(result, "success", False):
                 return True
         except Exception as send_err:
             logger.warning("%s boundary: fallback send also failed: %s", _reason, send_err)

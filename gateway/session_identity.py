@@ -116,6 +116,8 @@ def replace_source(source: "SessionSource", **changes: Any) -> "SessionSource":
     authorization home, identity). A plain ``replace`` silently produces a source the runner
     can only route through heuristics."""
     copied = dataclasses.replace(source, **changes)
+    if any(name in changes and changes[name] != getattr(source, name) for name in ("user_id", "is_bot")):
+        copied.author_kind_verified = False
     for name in _PROVENANCE_ATTRS:
         value = getattr(source, name, None)
         if value is not None:

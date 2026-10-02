@@ -201,7 +201,7 @@ class SessionMessagesMixin:
     def _check_transcript_write_guards(self, conn, session_id: str, compression_lock_holder: Optional[str],
         turn_lease_holder: Optional[str] = None, turn_lease_ttl_seconds: float = 300.0,
         reject_active_turn_lease: bool = False, reject_active_compression_lock: bool = False,
-        allow_closed_compression_parent: bool = False) -> None:
+        allow_closed_compression_parent: bool = False, require_active_session: bool = False) -> None:
         """Transcript-write admission checks, run INSIDE the write txn by every writer. Ordinary appends do
         NOT check compression_locks: the lock only stops two COMPRESSIONS colliding and archive_and_compact()
         commits against a watermark, so concurrent appends are safe (blocking them killed turns during slow
@@ -252,8 +252,11 @@ class SessionMessagesMixin:
                 # Same reclaim rule as acquisition; deleting also fences a stale late flush after the mutation.
                 conn.execute("DELETE FROM session_turn_leases WHERE conversation_id = ? AND holder = ?",
                     (conversation_id, lease["holder"]))
-        if _ended_by_compression(conn.execute(_ENDED_ROW_SQL, (session_id,)).fetchone()) and not allow_closed_compression_parent:
+        session_row = conn.execute(_ENDED_ROW_SQL, (session_id,)).fetchone()
+        if _ended_by_compression(session_row) and not allow_closed_compression_parent:
             raise CompressionSessionClosedError(session_id)
+        if require_active_session and (session_row is None or session_row["ended_at"] is not None):
+            raise ValueError(f"Session is no longer active; refusing delivery attachment for {session_id!r}")
 
     def _message_row_params(self, session_id: str, role: str, msg: Dict[str, Any], tool_calls: Any,
         message_timestamp: float, *, keep_reasoning: bool) -> tuple:
@@ -386,7 +389,8 @@ class SessionMessagesMixin:
         api_content: Optional[str] = None, display_kind: Optional[str] = None,
         display_metadata: Optional[Dict[str, Any]] = None, compression_lock_holder: Optional[str] = None,
         turn_lease_holder: Optional[str] = None, turn_lease_ttl_seconds: float = 300.0,
-        message_uid: Optional[str] = None) -> int:
+        message_uid: Optional[str] = None, reject_active_turn_lease: bool = False,
+        require_active_session: bool = False) -> int:
         """Append one message; returns the row id and bumps the session counters. ``platform_message_id``:
         the platform's own id. ``api_content``: byte-fidelity sidecar, the exact string sent to the API when
         it differed from ``content``, stored as sent except lone surrogates. ``message_uid``: the id a caller
@@ -403,7 +407,11 @@ class SessionMessagesMixin:
             session_id, role, msg, tool_calls, message_timestamp, keep_reasoning=True)
         def _do(conn):
             self._check_transcript_write_guards(conn, session_id, compression_lock_holder,
-                turn_lease_holder=turn_lease_holder, turn_lease_ttl_seconds=turn_lease_ttl_seconds)
+                turn_lease_holder=turn_lease_holder, turn_lease_ttl_seconds=turn_lease_ttl_seconds,
+                reject_active_turn_lease=reject_active_turn_lease, require_active_session=require_active_session)
+            if role == "user":
+                self._record_public_context_input(conn, session_id, msg)
+                self._consume_gateway_intake(conn, session_id, msg)
             msg_id = conn.execute(_INSERT_MESSAGE_SQL, params).lastrowid
             self._bump_session_counters(conn, session_id, 1, _tool_calls_count(tool_calls), unit=True)
             return msg_id
@@ -761,6 +769,9 @@ class SessionMessagesMixin:
             # the live dict never disagree. Tool calls get their per-occurrence ids the same way.
             stamp_message_uid(msg)
             self._stamp_tool_call_uids(msg, tool_calls, batch_tool_index)
+            if role == "user":
+                self._record_public_context_input(conn, session_id, msg)
+                self._consume_gateway_intake(conn, session_id, msg)
             cur = conn.execute(_INSERT_MESSAGE_SQL, self._message_row_params(
                 session_id, role, msg, tool_calls, message_timestamp, keep_reasoning=role == "assistant"))
             # Keep the caller's live row aligned with the durable identity. Rows created without an explicit

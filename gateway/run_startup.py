@@ -1490,6 +1490,8 @@ class GatewayStartupMixin:
         # Auto-resume restart-interrupted sessions (ledger-answered ones were cleared above); a failed
         # auto-resume stays visible on the next user message.
         self._schedule_resume_pending_sessions()
+        # Older durable physical inputs precede the live startup-restore queue.
+        await self._drain_durable_intakes()
         await self._finish_startup_restore()
         # Surface state.db init failures to messaging platforms before the user loses data.
         # See #88235.

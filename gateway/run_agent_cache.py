@@ -492,6 +492,40 @@ class GatewayAgentCacheMixin:
         _generation_at_interrupt = self._interrupt_running_turn(
             session_key, interrupt_reason=interrupt_reason, invalidation_reason=invalidation_reason,
         )
+        adapter = self._delivery_adapter_for(source)
+        # Capture and remove the old human FIFO before any await. New inputs
+        # during the command keep their own slot; every internal wake survives.
+        cancelled_events = []
+        if adapter and hasattr(adapter, "get_pending_message"):
+            parked = adapter.get_pending_message(session_key)
+            overflow = self._overflow_queue(session_key)
+            if getattr(adapter, "durable_intake", False) is True:
+                old_queue = ([parked] if parked is not None else []) + list(overflow or ())
+                wakes = [event for event in old_queue if getattr(event, "internal", False)]
+                cancelled_events = [event for event in old_queue if not getattr(event, "internal", False)]
+                if overflow is not None:
+                    overflow[:] = wakes[1:]
+                if wakes:
+                    adapter._pending_messages[session_key] = wakes[0]
+            else:
+                # Preserve the existing non-opt-in behavior: discard its human
+                # head and rescue the first internal wake without clearing overflow.
+                wake = parked if getattr(parked, "internal", False) else None
+                if wake is None:
+                    wake = next((event for event in overflow or () if event.internal), None)
+                    if wake is not None:
+                        overflow.remove(wake)
+                if wake is not None:
+                    adapter._pending_messages[session_key] = wake
+        # A consumed ordinary user row remains terminal. Pending active input
+        # and durable queue-cap overflow are stopped in the same existing store.
+        active_event = state.turn.event if state is not None else None
+        if active_event is not None and not active_event.internal:
+            cancelled_events.append(active_event)
+        refused = await self._refuse_durable_intake_route(source, session_key)
+        for event in cancelled_events:
+            if any(receipt["receipt_id"] in refused for receipt in getattr(event, "_gateway_intake_receipts", ())):
+                event._gateway_intake_refused = True
         from gateway.run import _AGENT_PENDING_SENTINEL
         # The turn's hard interrupt reaches only its in-turn children; background delegations were
         # detached at dispatch and would otherwise run to completion and wake the session later.
@@ -517,7 +551,6 @@ class GatewayAgentCacheMixin:
                 )
             except Exception:
                 logger.debug("agent_loop_stopped hook dispatch failed", exc_info=True)
-        adapter = self._delivery_adapter_for(source)
         interrupt_session_activity = getattr(type(adapter), "interrupt_session_activity", None)
         if adapter and callable(interrupt_session_activity):
             metadata = self._thread_metadata_for_source(source)
@@ -525,24 +558,6 @@ class GatewayAgentCacheMixin:
                 await adapter.interrupt_session_activity(session_key, source.chat_id, metadata=metadata)
             else:
                 await adapter.interrupt_session_activity(session_key, source.chat_id)
-        if adapter and hasattr(adapter, "get_pending_message"):
-            # Discard a stale human follow-up (the slot held only user text when /stop started doing
-            # this, 59575d6a917) — but an internal wake (async-delegation completion, notify+wake)
-            # shares the slot now and was claim-settled on admission, so dropping it loses it for
-            # good and the session idles until the next user message (#114456). Leave it parked for
-            # the adapter's post-command drain; a wake queued behind a discarded human head is
-            # promoted out of the overflow FIFO for the same reason. Whether a wake may still run
-            # against a session /new just closed is decided where it is processed
-            # (_resolve_async_delegation_session fails closed), not here.
-            parked = adapter.get_pending_message(session_key)
-            wake = parked if getattr(parked, "internal", False) else None
-            if wake is None:
-                overflow = self._overflow_queue(session_key) or []
-                wake = next((e for e in overflow if getattr(e, "internal", False)), None)
-                if wake is not None:
-                    overflow.remove(wake)
-            if wake is not None:
-                adapter._pending_messages[session_key] = wake
         if state is not None:
             state.persistent.pending_command_text = None
         if release_running_state:

@@ -1945,7 +1945,9 @@ class GatewayTurnMixin:
             # Streaming delivered the body, but the footer was held back (`not already_sent` gate).
             if _footer_line and adapter:
                 try:
-                    await adapter.send(source.chat_id, _footer_line, metadata=self._event_thread_metadata(event, source))
+                    footer_result = await adapter.send(source.chat_id, _footer_line, metadata=self._event_thread_metadata(event, source))
+                    from gateway.public_context import record_event_delivery
+                    await record_event_delivery(self, event, adapter, footer_result)
                 except Exception as _e:
                     logger.debug("trailing footer send failed: %s", _e)
             # Return None so the body isn't sent twice; stash the delivered text on the event for the
@@ -2041,17 +2043,31 @@ class GatewayTurnMixin:
         persistence_session_id: Optional[str] = None
         persistence_owner: Optional[str] = None
         title_user_message: Optional[str] = None
+        public_context: Optional[dict] = None
 
     async def _hmwa_prepare_turn(self, event, source, session_entry, session_key, _quick_key, run_generation):
         """Everything between session resolution and the agent run: session open, task-local env,
         context prompt, sidecar notes, turn lease, transcript load + hygiene, inbound text. Returns
         ``(_PreparedTurn, env_tokens)``; a ``str`` first element is a reply to send instead of
         running (history unreadable); ``None`` drops the turn (inbound text rejected)."""
-        from gateway.run import _load_gateway_config
         _was_auto_reset, _is_new_session = await self._hmwa_open_session(session_entry, session_key, source)
         context = build_session_context(source, self.config, session_entry)
         # Session context variables for tools (task-local, concurrency-safe)
         _session_env_tokens = self._set_session_env(context)
+        try:
+            prepared, tokens = await self._hmwa_prepare_bound_turn(
+                event, source, session_entry, session_key, _quick_key, run_generation,
+                context, _session_env_tokens, _was_auto_reset, _is_new_session)
+        except BaseException:
+            self._clear_session_env(_session_env_tokens)
+            raise
+        if not isinstance(prepared, self._PreparedTurn):
+            self._clear_session_env(_session_env_tokens)
+        return prepared, tokens
+
+    async def _hmwa_prepare_bound_turn(self, event, source, session_entry, session_key, _quick_key,
+                                      run_generation, context, _session_env_tokens, _was_auto_reset, _is_new_session):
+        from gateway.run import _load_gateway_config
         # Self-injected turns (MessageEvent(internal=True)) persist with a DB-only display_kind so
         # UIs render timeline notices, not user bubbles; role/content untouched.
         persist_user_display_kind = display_kind_for_event(event)
@@ -2096,10 +2112,25 @@ class GatewayTurnMixin:
                 event, source, session_entry, session_key, history, _quick_key, run_generation,
             )
         except TranscriptReadError:
-            self._clear_session_env(_session_env_tokens)
             return t("gateway.errors.history_unavailable"), _session_env_tokens
 
         await self._hmwa_first_contact_notes(source, history, turn_sidecar_notes)
+
+        # Public chat history is adapter-owned context, admitted once at the
+        # ordinary turn boundary. Fetch outside SQLite/routing locks; the user
+        # row's transaction rechecks the conversation generation before the API.
+        public_context = None
+        adapter = self._delivery_adapter_for(source)
+        prepare_context = getattr(adapter, "prepare_public_context", None)
+        db = self.session_store._db_for_key(session_key)
+        if callable(prepare_context) and hasattr(db, "public_context_state"):
+            try:
+                from gateway.public_context import prepare_public_admission
+                public_context = await prepare_public_admission(
+                    self.session_store, adapter, event, session_entry.session_id, session_key)
+            except Exception:
+                logger.warning("Public chat context unavailable for %s", session_key, exc_info=True)
+                return t("gateway.errors.history_unavailable"), _session_env_tokens
 
         # Voice channel state rides the user message ONLY when changed (in the system prompt it
         # forced a rebuild + prompt-cache re-key per message).
@@ -2112,6 +2143,7 @@ class GatewayTurnMixin:
             event=event, source=source, history=history, session_key=session_key,
         )
         if message_text is None:
+            await self._refuse_durable_intake_event(event)
             return None, _session_env_tokens
 
         message_text, persist_user_message, persist_user_timestamp = (
@@ -2133,14 +2165,31 @@ class GatewayTurnMixin:
                      source.chat_id, source.thread_id, str(event.message_id)]
         owner = (str(uuid.uuid5(uuid.NAMESPACE_URL, json.dumps(namespace)))
                  if event.message_id else str(uuid.uuid4()))
+        if public_context is not None:
+            owner = public_context["input_owner"]
         return self._PreparedTurn(
             history, context_prompt, message_text, persist_user_message, persist_user_timestamp,
             persist_user_display_kind, session_entry.session_id, owner,
             title_user_message=title_user_message,
+            public_context=public_context,
         ), _session_env_tokens
 
     async def _handle_message_with_agent(self, event, source, _quick_key: str, run_generation: int):
         """Inner handler that runs under the _running_agents sentinel guard."""
+        task = asyncio.current_task()
+        prior_event = getattr(task, "_gateway_intake_event", None)
+        if task is not None:
+            task._gateway_intake_event = event
+        try:
+            return await self._handle_message_with_agent_admitted(event, source, _quick_key, run_generation)
+        finally:
+            try:
+                await self._settle_durable_intake_turn(event, session_key=_quick_key, run_generation=run_generation)
+            finally:
+                if task is not None:
+                    task._gateway_intake_event = prior_event
+
+    async def _handle_message_with_agent_admitted(self, event, source, _quick_key: str, run_generation: int):
         _msg_start_time = time.time()
         _platform_name = source.platform.value if hasattr(source.platform, "value") else str(source.platform)
         logger.info(
@@ -2192,6 +2241,7 @@ class GatewayTurnMixin:
                 # Persist the coherent context+channel pair before execution: a crash during the
                 # human turn may be followed by an internal startup-resume on the next process.
                 await self._persist_prompt_pins(session_key, _run_start_session_id)
+            from gateway.run_intake import intake_metadata
             agent_result = await self._run_agent(
                 message=message_text, context_prompt=prepared.context_prompt, history=history, source=_turn_source,
                 session_id=_run_start_session_id, session_key=session_key,
@@ -2205,6 +2255,8 @@ class GatewayTurnMixin:
                 reply_expected=event.reply_expected,
                 persist_user_display_metadata={
                     "gateway_input_owner": prepared.persistence_owner,
+                    **({"public_context": prepared.public_context} if prepared.public_context else {}),
+                    **intake_metadata(event),
                     **reply_expected_metadata(event.reply_expected), **diagnostic_metadata(event)},
                 message_type=event.message_type,
                 scheduled_heartbeat=bool(getattr(event, "_heartbeat_session_id", None)),
@@ -2753,6 +2805,10 @@ class GatewayTurnMixin:
         source: "SessionSource", session_id: str, session_key: str = None,
         run_generation: Optional[int] = None, event_message_id: Optional[str] = None,
         scheduled_heartbeat: bool = False,
+        persist_user_message: Optional[Any] = None, persist_user_timestamp: Optional[float] = None,
+        persist_user_display_kind: Optional[str] = None,
+        persist_user_display_metadata: Optional[dict] = None,
+        inbound_message_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Forward the message to a remote Hermes API server instead of running a local AIAgent.
 
@@ -2791,13 +2847,47 @@ class GatewayTurnMixin:
                 "history_offset": len(history), "session_id": session_id, "response_previewed": False,
             }
 
-        # OpenAI chat format. The remote keeps continuity via X-Hermes-Session-Id; send the current
-        # message plus a compact text-only history for a remote that has none yet.
-        api_messages: List[Dict[str, str]] = [{"role": "system", "content": context_prompt}] if context_prompt else []
-        api_messages += [
-            {"role": msg.get("role"), "content": msg.get("content")}
-            for msg in history if msg.get("role") in {"user", "assistant"} and msg.get("content")
-        ]
+        # The proxy is a provider boundary too. Commit the exact API-bound input
+        # and its receipts locally before making a possibly accepted remote call.
+        proxy_user, admission_db = None, None
+        metadata = persist_user_display_metadata or {}
+        public_batch = metadata.get("public_context")
+        intake_receipts = metadata.get("gateway_intake")
+        if public_batch or intake_receipts:
+            from types import SimpleNamespace
+            from agent.turn_context import _stage_turn_user_message
+            from agent.session_persistence import durable_user_row_content
+            proxy_user, _ = _stage_turn_user_message(
+                SimpleNamespace(), message, persist_user_message, persist_user_timestamp,
+                inbound_message_id, persist_user_display_kind, metadata)
+            content, api_content = durable_user_row_content(
+                SimpleNamespace(_persist_user_message_override=persist_user_message), proxy_user,
+                proxy_user["content"], proxy_user.get("api_content"))
+            admission_db = self.session_store._db_for_key(session_key)
+            await asyncio.to_thread(
+                admission_db.append_message, session_id, "user", content,
+                api_content=api_content, display_kind=persist_user_display_kind,
+                display_metadata=metadata, platform_message_id=inbound_message_id,
+                timestamp=persist_user_timestamp)
+            if public_batch and not admission_db.public_context_was_accepted(session_id, public_batch):
+                from hermes_state_public_context import PublicContextAdmissionError
+                raise PublicContextAdmissionError("proxy input was not persisted before the provider request")
+            if intake_receipts and not admission_db.gateway_intake_was_consumed(session_id, intake_receipts):
+                raise RuntimeError("proxy intake was not persisted before the provider request")
+            message = proxy_user.get("api_content") or proxy_user["content"]
+
+        # The remote may be fresh after restart. Public-context rows must replay
+        # the API-bound bytes, including media, whose physical refs were consumed.
+        api_messages: List[Dict[str, Any]] = [{"role": "system", "content": context_prompt}] if context_prompt else []
+        for msg in history:
+            if msg.get("role") not in {"user", "assistant"}:
+                continue
+            content = msg.get("content")
+            if ((msg.get("display_metadata") or {}).get("public_context")
+                    and msg.get("api_content") is not None):
+                content = msg["api_content"]
+            if content:
+                api_messages.append({"role": msg["role"], "content": content})
         api_messages.append({"role": "user", "content": message})
 
         headers: Dict[str, str] = {"Content-Type": "application/json"}
@@ -2851,6 +2941,10 @@ class GatewayTurnMixin:
             # (DNS fail, firewall, remote down) fails fast instead of hanging on the OS default.
             _timeout = ClientTimeout(total=0, sock_read=1800, sock_connect=30)
             async with _AioClientSession(timeout=_timeout) as session:
+                # Typing and client setup await after admission; a reset there
+                # must prevent starting a remote turn for the old generation.
+                if not _run_still_current():
+                    return _stale_result("request")
                 async with session.post(f"{proxy_url}/v1/chat/completions", json=body, headers=headers) as resp:
                     if resp.status != 200:
                         error_text = await resp.text()
@@ -2902,7 +2996,14 @@ class GatewayTurnMixin:
                     await asyncio.wait_for(stream_task, timeout=5.0)
                 except (asyncio.TimeoutError, asyncio.CancelledError):
                     stream_task.cancel()
+            if public_batch and _stream_consumer:
+                from gateway.public_context import record_public_delivery
+                await record_public_delivery(
+                    self.session_store, _adapter, source, session_id, public_batch,
+                    getattr(_stream_consumer, "delivered_message_ids", ()))
 
+        if admission_db is not None and full_response and _run_still_current():
+            await asyncio.to_thread(admission_db.append_message, session_id, "assistant", full_response)
         _elapsed = time.time() - _start
         if not _run_still_current():
             return _stale_result("result")
@@ -2913,9 +3014,11 @@ class GatewayTurnMixin:
         return {
             "final_response": full_response or t("gateway.proxy.no_response"),
             "messages": [
-                {"role": "user", "content": message},
+                *(history if proxy_user is not None else ()),
+                proxy_user or {"role": "user", "content": message},
                 {"role": "assistant", "content": full_response},
             ],
+            **({"agent_persisted": True} if proxy_user is not None else {}),
             "api_calls": 1,
             "tools": [],
             "history_offset": len(history),
@@ -3701,66 +3804,76 @@ class GatewayTurnMixin:
         if turn_ctx.mute_notification_reply:
             return
         session_key = turn_ctx.session_key
-        _sc = turn_ctx.stream_consumer_holder[0]
-        if _sc and stream_task:
-            try:
-                await self._await_stream_task(stream_task)
-            except Exception as e:
-                logger.debug("Stream consumer wait before queued message failed: %s", e)
-        # Delivery uses the finalized task result (empty/failure normalization), not raw ``result``.
-        _delivery_result = response if isinstance(response, dict) else (result or {})
-        first_response = _delivery_result.get("final_response", "")
-        _already_streamed = self._run_agent_stream_confirmed_final_delivery(
-            _sc, first_response, previewed=bool(_delivery_result.get("response_previewed")),
-        )
-        # Same silence predicate as the normal path, else this branch leaks the literal marker.
-        if self._is_intentional_silence(_delivery_result, first_response):
-            if silence_allowed(turn_ctx.persist_user_display_kind, turn_ctx.reply_expected):
-                logger.info(
-                    "Queued follow-up for session %s: suppressing intentional silence marker before continuing.",
-                    session_key or "?",
-                )
-                first_response = ""
-            else:
-                logger.warning(
-                    "Queued follow-up for session %s: replacing a human-turn silence marker.",
-                    session_key or "?",
-                )
-                first_response = _unexpected_silence_reply()
-                _already_streamed = False
-        # Failed turns deliver their text but never their attachments (completed-turn parity).
-        _deliver_media = not _delivery_result.get("failed")
-        if first_response:
-            logger.info(
-                "Queued follow-up for session %s: final text delivery confirmed; delivering explicit media before continuing."
-                if _already_streamed else
-                "Queued follow-up for session %s: final stream delivery not confirmed; sending first response before continuing.",
-                session_key or "?",
+        public_output_ids = []
+        try:
+            _sc = turn_ctx.stream_consumer_holder[0]
+            if _sc and stream_task:
+                try:
+                    await self._await_stream_task(stream_task)
+                except Exception as e:
+                    logger.debug("Stream consumer wait before queued message failed: %s", e)
+            # Delivery uses the finalized task result (empty/failure normalization), not raw ``result``.
+            _delivery_result = response if isinstance(response, dict) else (result or {})
+            first_response = _delivery_result.get("final_response", "")
+            _already_streamed = self._run_agent_stream_confirmed_final_delivery(
+                _sc, first_response, previewed=bool(_delivery_result.get("response_previewed")),
             )
-            try:
-                _text_delivered = await self._deliver_queued_first_response(
-                    first_response, source=turn_ctx.source, adapter=adapter,
-                    metadata=turn_ctx._status_thread_metadata, event_message_id=turn_ctx.event_message_id,
-                    text_already_delivered=_already_streamed,
-                    deliver_media=_deliver_media, stream_consumer=_sc,
-                    # The text send records a delivery-ledger obligation under this key, keyed on
-                    # the raw inbound id (the anchor above is only the reply target).
-                    session_key=session_key, inbound_message_id=turn_ctx.inbound_message_id,
+            # Same silence predicate as the normal path, else this branch leaks the literal marker.
+            if self._is_intentional_silence(_delivery_result, first_response):
+                if silence_allowed(turn_ctx.persist_user_display_kind, turn_ctx.reply_expected):
+                    logger.info(
+                        "Queued follow-up for session %s: suppressing intentional silence marker before continuing.",
+                        session_key or "?",
+                    )
+                    first_response = ""
+                else:
+                    logger.warning(
+                        "Queued follow-up for session %s: replacing a human-turn silence marker.",
+                        session_key or "?",
+                    )
+                    first_response = _unexpected_silence_reply()
+                    _already_streamed = False
+            # Failed turns deliver their text but never their attachments (completed-turn parity).
+            _deliver_media = not _delivery_result.get("failed")
+            if first_response:
+                logger.info(
+                    "Queued follow-up for session %s: final text delivery confirmed; delivering explicit media before continuing."
+                    if _already_streamed else
+                    "Queued follow-up for session %s: final stream delivery not confirmed; sending first response before continuing.",
+                    session_key or "?",
                 )
-            except Exception as e:
-                logger.warning("Failed to send first response before queued message: %s", e)
-            else:
-                # One source of truth for "this turn's final already reached the chat": the normal
-                # completion path (`_hmwa_deliver_turn_response`) consults ``already_sent`` on the
-                # result the queued lane hands back. Every early `return result` after this point
-                # (follow-up text refused, stale goal continuation) otherwise re-sends the text the
-                # fallback just delivered — the #81052 duplicate. A REFUSED send reports False, and
-                # the completion send stays the fallback so the user is not left with nothing.
-                if _text_delivered and isinstance(result, dict):
-                    result["already_sent"] = True
-                    # The queued lane already uploaded this response's MEDIA: attachments; without
-                    # this the completion path's already_sent rescan uploads every file twice.
-                    result["media_already_delivered"] = _deliver_media
+                try:
+                    _text_delivered = await self._deliver_queued_first_response(
+                        first_response, source=turn_ctx.source, adapter=adapter,
+                        metadata=turn_ctx._status_thread_metadata, event_message_id=turn_ctx.event_message_id,
+                        text_already_delivered=_already_streamed,
+                        deliver_media=_deliver_media, stream_consumer=_sc,
+                        # The text send records a delivery-ledger obligation under this key, keyed on
+                        # the raw inbound id (the anchor above is only the reply target).
+                        session_key=session_key, inbound_message_id=turn_ctx.inbound_message_id,
+                        delivered_message_ids=public_output_ids,
+                    )
+                except Exception as e:
+                    logger.warning("Failed to send first response before queued message: %s", e)
+                else:
+                    # One source of truth for "this turn's final already reached the chat": the normal
+                    # completion path (`_hmwa_deliver_turn_response`) consults ``already_sent`` on the
+                    # result the queued lane hands back. Every early `return result` after this point
+                    # (follow-up text refused, stale goal continuation) otherwise re-sends the text the
+                    # fallback just delivered — the #81052 duplicate. A REFUSED send reports False, and
+                    # the completion send stays the fallback so the user is not left with nothing.
+                    if _text_delivered and isinstance(result, dict):
+                        result["already_sent"] = True
+                        # The queued lane already uploaded this response's MEDIA: attachments; without
+                        # this the completion path's already_sent rescan uploads every file twice.
+                        result["media_already_delivered"] = _deliver_media
+        finally:
+            public_batch = (turn_ctx.persist_user_display_metadata or {}).get("public_context")
+            if public_batch:
+                from gateway.public_context import record_public_delivery
+                await record_public_delivery(
+                    self.session_store, adapter, turn_ctx.source, turn_ctx.session_id, public_batch,
+                    public_output_ids + list(getattr(_sc, "delivered_message_ids", ())))
         # Release deferred bg-review notifications: pop (no double-fire in base.py's finally) and call.
         _bg_cb = self._pop_post_delivery_callback(adapter, session_key, turn_ctx.run_generation)
         if callable(_bg_cb):
@@ -3774,8 +3887,28 @@ class GatewayTurnMixin:
         response: Any, result: Any, stream_task: Any,
     ) -> Any:
         """Run the queued / interrupting follow-up as the next turn (recursive ``_run_agent``)."""
+        task = asyncio.current_task()
+        prior_event = getattr(task, "_gateway_intake_event", None)
+        if task is not None:
+            task._gateway_intake_event = pending_event
+        try:
+            return await self._run_agent_queued_followup_admitted(
+                turn_ctx, adapter, pending, pending_event, response, result, stream_task)
+        finally:
+            try:
+                await self._settle_durable_intake_turn(
+                    pending_event, session_key=turn_ctx.session_key, run_generation=turn_ctx.run_generation)
+            finally:
+                if task is not None:
+                    task._gateway_intake_event = prior_event
+
+    async def _run_agent_queued_followup_admitted(
+        self, turn_ctx: TurnContext, adapter: Any, pending: Optional[str], pending_event: Any,
+        response: Any, result: Any, stream_task: Any,
+    ) -> Any:
         from gateway.platforms.base import merge_pending_message_event
         from gateway.run import _preserve_queued_followup_history_offset
+        from gateway.run_intake import intake_metadata
         source, session_id, session_key, run_generation = (
             turn_ctx.source, turn_ctx.session_id, turn_ctx.session_key, turn_ctx.run_generation,
         )
@@ -3789,6 +3922,19 @@ class GatewayTurnMixin:
         if _active and session_key and session_key in _active:
             _active[session_key].clear()
 
+        # Even an interrupted run may have delivered commentary or segment
+        # tails. Attribute their physical identities before any early return or
+        # recursive admission can read them back as new public context.
+        public_batch = (turn_ctx.persist_user_display_metadata or {}).get("public_context")
+        consumer = turn_ctx.stream_consumer_holder[0]
+        if public_batch and consumer is not None:
+            if stream_task:
+                await self._await_stream_task(stream_task)
+            from gateway.public_context import record_public_delivery
+            await record_public_delivery(
+                self.session_store, adapter, source, session_id, public_batch,
+                getattr(consumer, "delivered_message_ids", ()))
+
         # Cap recursion depth (user keeps sending while the agent keeps failing).
         # (#816)
         if _interrupt_depth >= self._MAX_INTERRUPT_DEPTH:
@@ -3797,7 +3943,14 @@ class GatewayTurnMixin:
                 "queueing message instead of recursing.", _interrupt_depth, session_key,
             )
             adapter = self._delivery_adapter_for(source)
-            if adapter and pending_event:
+            if pending_event and getattr(pending_event, "_gateway_intake_receipts", ()):
+                queued_source = getattr(pending_event, "source", None) or source
+                queued_adapter = self._intake_adapter_for(queued_source)
+                queued_key = self._session_key_for_source(queued_source)
+                if not self._restore_fifo_head(queued_key, pending_event, queued_adapter):
+                    pending_event._gateway_accepted = False
+                    await self._finish_durable_intake_handoff(pending_event)
+            elif adapter and pending_event:
                 merge_pending_message_event(adapter._pending_messages, session_key, pending_event)
             elif adapter and hasattr(adapter, 'queue_message'):
                 adapter.queue_message(session_key, pending)
@@ -3828,6 +3981,14 @@ class GatewayTurnMixin:
                     session_key or "?",
                 )
                 return result
+            if getattr(pending_event, "_gateway_intake_receipts", ()):
+                # In-band recursion bypasses the ordinary gateway handler.
+                # Reuse its current actor/source/recipient admission before
+                # any queued public bytes or media can reach the next turn.
+                admitted = await self._hm_admit_event(pending_event)
+                if admitted is None:
+                    return result
+                pending_event, next_source, _internal = admitted
             # Resolve the follow-up's session key BEFORE preparing the inbound text: native image
             # paths are buffered under the key given and consumed under next_session_key.
             try:
@@ -3841,6 +4002,7 @@ class GatewayTurnMixin:
                 event=pending_event, source=next_source, history=updated_history, session_key=next_session_key,
             )
             if next_message is None:
+                await self._refuse_durable_intake_event(pending_event)
                 return result
             from gateway.run_inbound import strip_discord_triggering_note
             next_persist_message = strip_discord_triggering_note(pending_event, next_message)
@@ -3896,6 +4058,13 @@ class GatewayTurnMixin:
         try:
             await self._refresh_agent_cache_message_count(session_key, session_id)
 
+            next_public_context = None
+            if pending_event is not None:
+                from gateway.public_context import prepare_public_admission
+                next_public_context = await prepare_public_admission(
+                    self.session_store, self._delivery_adapter_for(next_source), pending_event,
+                    session_id, next_session_key)
+
             followup_result = await self._run_agent(
                 message=next_message, context_prompt=turn_ctx.context_prompt, history=updated_history,
                 source=next_source, session_id=session_id, session_key=next_session_key,
@@ -3906,6 +4075,9 @@ class GatewayTurnMixin:
                 persist_user_display_kind=next_display_kind,
                 reply_expected=next_reply_expected,
                 persist_user_display_metadata={
+                    **intake_metadata(pending_event),
+                    **({"public_context": next_public_context,
+                        "gateway_input_owner": next_public_context["input_owner"]} if next_public_context else {}),
                     **reply_expected_metadata(next_reply_expected), **diagnostic_metadata(pending_event)} or None,
             )
         except asyncio.CancelledError:
@@ -3940,6 +4112,7 @@ class GatewayTurnMixin:
     async def _run_agent_cleanup_turn_tasks(
         self, turn_ctx: TurnContext, *, progress_task: Any, log_task: Any, interrupt_monitor: "asyncio.Task",
         _notify_task: "asyncio.Task", tracking_task: "asyncio.Task", stream_task: Any,
+        completed_response: Any = None,
     ) -> None:
         """``finally`` half of a turn: cancel background tasks, flush stream, release the session slot."""
         stream_consumer_holder, session_key = turn_ctx.stream_consumer_holder, turn_ctx.session_key
@@ -3947,40 +4120,55 @@ class GatewayTurnMixin:
             if task:
                 task.cancel()
 
-        if stream_task:
-            # No stream consumer was created: nothing to flush, cancel instead of waiting out 5s.
-            if not (stream_consumer_holder and stream_consumer_holder[0] is not None):
-                stream_task.cancel()
-                with suppress(asyncio.CancelledError):
-                    await stream_task
-            else:
-                await self._await_stream_task(stream_task)
+        try:
+            if stream_task:
+                # No stream consumer was created: nothing to flush, cancel instead of waiting out 5s.
+                if not (stream_consumer_holder and stream_consumer_holder[0] is not None):
+                    stream_task.cancel()
+                    with suppress(asyncio.CancelledError):
+                        await stream_task
+                else:
+                    await self._await_stream_task(stream_task)
 
-        # Abort + bounded wait for streaming TTS: covers paths where normal finalisation was skipped.
-        _stts_finally = turn_ctx.streaming_tts_consumer_holder[0]
-        # See #60671.
-        if _stts_finally is not None and not _stts_finally.done:
-            _stts_finally.abort("cleanup")
-            with suppress(Exception):
-                await _stts_finally.wait_complete(timeout=2.0)
+            # Final reconciliation can edit a persisted preview. Bind the final
+            # revision after that edit, while this turn still owns the route.
+            if completed_response is not None and turn_ctx._run_still_current():
+                await self._run_agent_mark_streamed_delivery(completed_response, turn_ctx)
+        finally:
+            try:
+                public_batch = (turn_ctx.persist_user_display_metadata or {}).get("public_context")
+                consumer = stream_consumer_holder[0]
+                if public_batch and consumer is not None:
+                    from gateway.public_context import record_public_delivery
+                    await record_public_delivery(
+                        self.session_store, self._delivery_adapter_for(turn_ctx.source), turn_ctx.source,
+                        turn_ctx.session_id, public_batch, getattr(consumer, "delivered_message_ids", ()))
+            finally:
+                # Abort + bounded wait for streaming TTS: covers paths where normal finalisation was skipped.
+                _stts_finally = turn_ctx.streaming_tts_consumer_holder[0]
+                # See #60671.
+                if _stts_finally is not None and not _stts_finally.done:
+                    _stts_finally.abort("cleanup")
+                    with suppress(Exception):
+                        await _stts_finally.wait_complete(timeout=2.0)
 
-        tracking_task.cancel()
-        if session_key:
-            # Release the slot only if this run's generation still owns it (/stop or /new may have
-            # installed its own state).
-            self._release_running_agent_state(session_key, run_generation=turn_ctx.run_generation)
-        if self._draining:
-            self._update_runtime_status("draining")
+                tracking_task.cancel()
+                if session_key:
+                    # Release the slot only if this run's generation still owns it (/stop or /new may have
+                    # installed its own state).
+                    self._release_running_agent_state(session_key, run_generation=turn_ctx.run_generation)
+                if self._draining:
+                    self._update_runtime_status("draining")
 
-        for task in (progress_task, log_task, interrupt_monitor, tracking_task, _notify_task):
-            if task:
-                try:
-                    await task
-                except asyncio.CancelledError:
-                    pass
-                except Exception:
-                    # A background task that died of a real error must not abort the cleanup path.
-                    logger.debug("background turn task failed during cleanup", exc_info=True)
+                for task in (progress_task, log_task, interrupt_monitor, tracking_task, _notify_task):
+                    if task:
+                        try:
+                            await task
+                        except asyncio.CancelledError:
+                            pass
+                        except Exception:
+                            # A background task that died of a real error must not abort the cleanup path.
+                            logger.debug("background turn task failed during cleanup", exc_info=True)
 
     async def _run_agent_edit_streamed_message(
         self, _sc, source, response, content, *, _sk, ok, fail_result: str, fail_exc: str,
@@ -4244,6 +4432,10 @@ class GatewayTurnMixin:
                 message=message, context_prompt=context_prompt, history=history, source=source,
                 session_id=session_id, session_key=session_key, run_generation=run_generation,
                 event_message_id=event_message_id, scheduled_heartbeat=scheduled_heartbeat,
+                persist_user_message=persist_user_message, persist_user_timestamp=persist_user_timestamp,
+                persist_user_display_kind=persist_user_display_kind,
+                persist_user_display_metadata=persist_user_display_metadata,
+                inbound_message_id=inbound_message_id,
             )
 
         from run_agent import AIAgent
@@ -4300,6 +4492,7 @@ class GatewayTurnMixin:
             else spawn(self._run_agent_notify_long_running(disp, turn_ctx, _executor_task_holder))
         )
 
+        completed_response = None
         try:
             # run_sync is TurnRunner.run_sync (bound method; executor call unchanged).
             worker = self._run_agent_start_turn_worker(turn_ctx, turn_runner.run_sync)
@@ -4318,12 +4511,13 @@ class GatewayTurnMixin:
                 return await self._run_agent_queued_followup(
                     turn_ctx, adapter, pending, pending_event, response, result, stream_task,
                 )
+            completed_response = response
         finally:
             await self._run_agent_cleanup_turn_tasks(
                 turn_ctx, progress_task=progress_task, log_task=log_task, interrupt_monitor=interrupt_monitor,
                 _notify_task=_notify_task, tracking_task=tracking_task, stream_task=stream_task,
+                completed_response=completed_response,
             )
 
-        await self._run_agent_mark_streamed_delivery(response, turn_ctx)
         self._run_agent_schedule_bubble_cleanup(response, _cleanup_adapter, turn_ctx)
         return response

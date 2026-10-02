@@ -5,6 +5,8 @@ was CLEARED: ``turn`` at the end of every turn; ``conversation`` at conversation
 
 from __future__ import annotations
 
+import asyncio
+
 from collections.abc import MutableMapping
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, Iterator, List, NamedTuple, Optional, Tuple
@@ -69,6 +71,9 @@ class PersistentState:
     native_image_paths: List[str] = field(default_factory=list)  # consumed one-shot
     # Legacy runner-level pending text (flushed on shutdown); not the adapter-level one.
     pending_command_text: Optional[str] = None
+    # FIFO handoff, not provider execution: an awaited visibility/adoption step
+    # must not let a later physical input overtake it. Survives turn/reset work.
+    intake_lock: Any = field(default_factory=asyncio.Lock)
     run_generation: int = 0  # monotonic; NEVER reset (stale-run detection depends on it)
     # Consecutive hygiene compression failures (the in-agent ladder is unreachable: hygiene builds
     # a FRESH AIAgent per run).  Reset on success; process-local, mirrored to the DB by run.py.

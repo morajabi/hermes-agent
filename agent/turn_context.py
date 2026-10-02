@@ -473,7 +473,7 @@ class TurnContext:
     preflight_compression_blocked: bool = False  # immediate retry proved ineffective
 
 
-def _persist_under_lock(agent: Any, fn, failure_msg: str, pending_cli_message: Any) -> None:
+def _persist_under_lock(agent: Any, fn, failure_msg: str, pending_cli_message: Any, *, required: bool = False) -> None:
     """Run ``fn`` under the session persist lock (when the agent has one), log-and-swallow
     failures, then drop staged CLI input — unless it is an unmarked handoff kept for a
     close retry (once ``_db_persisted`` the close path must not treat it as pre-worker
@@ -487,6 +487,8 @@ def _persist_under_lock(agent: Any, fn, failure_msg: str, pending_cli_message: A
                 fn()
     except Exception:
         logger.warning(failure_msg, agent.session_id or "none", exc_info=True)
+        if required:
+            raise
     finally:
         if not isinstance(pending_cli_message, dict) or pending_cli_message.get("_db_persisted"):
             agent._pending_cli_user_message = None
@@ -661,6 +663,15 @@ def _stage_turn_user_message(
         user_msg["display_kind"] = persist_user_display_kind
     if persist_user_display_metadata:
         user_msg["display_metadata"] = persist_user_display_metadata
+        public = persist_user_display_metadata.get("public_context") or {}
+        public_content = public.get("content")
+        if public_content:
+            # Stamp before preflight compression/early flush can persist this
+            # row. Public bytes and their receipts must always commit together.
+            if isinstance(user_message, str):
+                user_msg["api_content"] = compose_user_api_content(user_message, "", public_content)
+            elif isinstance(user_message, list):
+                append_notes_to_multimodal_content(user_msg["content"], public_content)
     # The platform message id survives the turn-start flush; restart drain-window
     # recovery dedups via ``has_platform_message_id`` against this row.
     if persist_user_platform_id is not None:
@@ -976,13 +987,26 @@ def _persist_turn_start(
     """Crash-resilience: persist the inbound user turn once, with final api_content,
     before the first LLM call. Same critical section as CLI close persistence; retries
     the row create if the pre-compression attempt failed transiently."""
+    current_idx = getattr(agent, "_persist_user_message_idx", None)
+    current = messages[current_idx] if isinstance(current_idx, int) and 0 <= current_idx < len(messages) else next(
+        (m for m in reversed(messages) if isinstance(m, dict) and m.get("role") == "user"), {})
+    metadata = current.get("display_metadata") or {}
+    public_batch = metadata.get("public_context") if isinstance(metadata, dict) else None
+    intake_receipts = metadata.get("gateway_intake") if isinstance(metadata, dict) else None
     def _ensure_and_persist() -> None:
         agent._ensure_db_session()
         agent._persist_session(messages, conversation_history)
+        if public_batch and not agent._session_db.public_context_was_accepted(agent.session_id, public_batch):
+            from hermes_state_public_context import PublicContextAdmissionError
+            raise PublicContextAdmissionError("public context was not persisted before the provider request")
+        if intake_receipts and not agent._session_db.gateway_intake_was_consumed(agent.session_id, intake_receipts):
+            from hermes_state_intake import GatewayIntakeError
+            raise GatewayIntakeError("gateway input was not persisted before the provider request")
 
     _persist_under_lock(
         agent, _ensure_and_persist,
         "Early turn-start session persistence failed for session=%s", pending_cli_message,
+        required=bool(public_batch or intake_receipts),
     )
 
 
@@ -1137,6 +1161,9 @@ def build_turn_context(
     plugin_user_context = _merge_gateway_notes(
         agent, messages, current_turn_user_idx, plugin_user_context
     )
+    public = (persist_user_display_metadata or {}).get("public_context") or {}
+    if public.get("content") and isinstance(user_message, str):
+        plugin_user_context = "\n\n".join(filter(None, (plugin_user_context, public["content"])))
 
     _bind_interrupt_scope(agent, ra)
     ext_prefetch_cache = _memory_turn_start_and_prefetch(agent, original_user_message, turn_author)
@@ -1153,7 +1180,7 @@ def build_turn_context(
                 agent, messages[current_turn_user_idx], ext_prefetch_cache, plugin_user_context,
                 preflight_compressed=compaction.compressed,
             )
-        elif not moa_active and getattr(agent, "api_mode", None) != "codex_app_server":
+        elif (not moa_active and getattr(agent, "api_mode", None) != "codex_app_server") or public:
             _stamp_api_content_sidecar(
                 agent, messages, current_turn_user_idx, ext_prefetch_cache,
                 plugin_user_context, preflight_compressed=compaction.compressed,

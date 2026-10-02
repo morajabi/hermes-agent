@@ -57,6 +57,45 @@ class SessionTranscriptMixin:
     # no longer a transient blip and needs operator attention.
     _TRANSCRIPT_APPEND_FAILURE_ESCALATION_THRESHOLD = 3
 
+    def append_delivery_to_session(self, source, content: str, *, role: str = "user") -> bool:
+        """Attach a visible delivery to the reply route without creating or guessing a history.
+
+        Existing routes heal after restart through the ordinary lifecycle lookup. Compression
+        may advance the route once; a reset, suspension or active agent turn fails closed.
+        The SQLite write transaction is the reset boundary: an ended row never receives a
+        delivery. Attachment does not advance the human activity clock or queue a resend.
+        """
+        from hermes_state_errors import CompressionSessionClosedError
+
+        key = self._generate_session_key(source)
+        observed = self.lookup_by_session_key(key)
+        if observed is None or observed.suspended:
+            return False
+        entry = self.get_or_create_session(source, touch_activity=False)
+        session_id = entry.session_id
+        db = self._db_for_key(key)
+        if db is None:
+            return False
+        for _ in range(2):
+            current = self.lookup_by_session_key(key)
+            if current is None or current.session_id != session_id or current.suspended:
+                return False
+            try:
+                db.append_message(
+                    session_id=session_id, role=role, content=content,
+                    require_active_session=True, reject_active_turn_lease=True,
+                )
+                return True
+            except CompressionSessionClosedError:
+                # The DB proves lineage, and the CAS refuses a concurrent /new or /resume.
+                child = db.get_compression_tip(session_id)
+                if not child or child == session_id:
+                    return False
+                if self.advance_compression_session(key, session_id, child) is None:
+                    return False
+                session_id = child
+        return False
+
     def _compression_tip_for_session_id(self, session_id: Optional[str]) -> Optional[str]:
         """Latest compression continuation for *session_id* (heals a mapping left pointing at a
         compressed parent by a restart or failed send)."""
@@ -100,8 +139,8 @@ class SessionTranscriptMixin:
                 return entry
             if not self._heal_compression_tip_locked(entry, expected_session_id, target_session_id):
                 return None  # route moved (session_id != expected) or nothing to heal
-            self._save()  # bookkeeping, not user activity: leave ``updated_at`` alone
-            return entry
+        self._save_entries()  # generation-protected I/O outside the routing lock
+        return entry
 
     def _get_transcript_drain_lock(self):
         """Return the lock that serializes pending-queue drain boundaries."""

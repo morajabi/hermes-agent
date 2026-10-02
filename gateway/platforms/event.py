@@ -95,6 +95,17 @@ class MessageEvent:
 
     # Process-local admission receipt, never routing metadata or execution acknowledgement.
     _gateway_accepted: bool = field(default=False, init=False, repr=False, compare=False)
+    # Host-owned durable adoption. None of these may be populated from wire metadata.
+    _gateway_durable_adopted: bool = field(default=False, init=False, repr=False, compare=False)
+    _gateway_intake_receipts: tuple = field(default=(), init=False, repr=False, compare=False)
+    _gateway_intake_snapshot: Optional[dict] = field(default=None, init=False, repr=False, compare=False)
+    _gateway_intake_owner: Optional[dict] = field(default=None, init=False, repr=False, compare=False)
+    _gateway_intake_prepared: bool = field(default=False, init=False, repr=False, compare=False)
+    _gateway_intake_generation: Optional[int] = field(default=None, init=False, repr=False, compare=False)
+    _gateway_intake_generation_unavailable: bool = field(default=False, init=False, repr=False, compare=False)
+    _gateway_intake_control: bool = field(default=False, init=False, repr=False, compare=False)
+    _gateway_intake_control_completed: bool = field(default=False, init=False, repr=False, compare=False)
+    _gateway_intake_refused: bool = field(default=False, init=False, repr=False, compare=False)
     # Run-owned final presentation snapshot; never deserialized from ingress metadata.
     _notification_reply_muted: Optional[bool] = field(default=None, init=False, repr=False, compare=False)
 

@@ -113,6 +113,18 @@ class GatewayBusySessionMixin:
             pending_slot[session_key] = queued_event
         queued_event._gateway_accepted = True
 
+    def _restore_fifo_head(self, session_key: str, queued_event: "MessageEvent", adapter: Any) -> bool:
+        """Restore a dequeued oldest input ahead of the already-promoted next input."""
+        pending_slot = getattr(adapter, "_pending_messages", None) if adapter is not None else None
+        if not isinstance(pending_slot, dict):
+            return False
+        promoted = pending_slot.get(session_key)
+        if promoted is not None and promoted is not queued_event:
+            self._session_state(session_key).conversation.queued_events.insert(0, promoted)
+        pending_slot[session_key] = queued_event
+        queued_event._gateway_accepted = True
+        return True
+
     def _promote_queued_event(
         self, session_key: str, adapter: Any, pending_event: Optional["MessageEvent"]
     ) -> Optional["MessageEvent"]:
@@ -405,6 +417,8 @@ class GatewayBusySessionMixin:
         }
         if (
             same_security_context
+            and not getattr(existing, "_gateway_intake_receipts", ())
+            and not getattr(event, "_gateway_intake_receipts", ())
             and MessageType.PHOTO in merge_types
             and merge_types <= {MessageType.TEXT, MessageType.PHOTO}
         ):
@@ -827,7 +841,7 @@ class GatewayBusySessionMixin:
             )
             return True  # handled (silently dropped); do not fall through
         # A steered or queued follow-up never reaches _hm_admit_event, so the budget is charged here.
-        if not self._admit_bot_message_for_source(event.source):
+        if not getattr(event, "_bot_loop_admitted", False) and not self._admit_bot_message_for_source(event.source):
             return True
         event._bot_loop_admitted = True
 
@@ -844,6 +858,11 @@ class GatewayBusySessionMixin:
         # steer; they surface as a NEW turn when idle. Plugin events carry untrusted payload text, so
         # queue them through the FIFO (security metadata kept apart).
         if getattr(event, "internal", False):
+            self._queue_or_replace_pending_event(session_key, event)
+            return True
+        if getattr(event, "_gateway_intake_receipts", ()):
+            # steer(text)/redirect(text) cannot atomically consume physical receipts.
+            # Opted-in physical inputs retain their own normal user-row turn FIFO.
             self._queue_or_replace_pending_event(session_key, event)
             return True
         if (
@@ -1044,19 +1063,26 @@ class GatewayBusySessionMixin:
             return t("gateway.queue.usage")
         adapter = self._delivery_adapter_for(source)
         if adapter:
-            self._enqueue_fifo(quick_key, MessageEvent(
-                text=queued_text, message_type=event.message_type if has_media else MessageType.TEXT,
-                source=event.source, raw_message=event.raw_message, message_id=event.message_id,
-                media_urls=list(getattr(event, "media_urls", []) or []),
-                media_types=list(getattr(event, "media_types", []) or []),
-                media_text_inlined=list(getattr(event, "media_text_inlined", []) or []),
-                reply_to_message_id=event.reply_to_message_id, reply_to_text=event.reply_to_text,
-                reply_to_author_id=event.reply_to_author_id,
-                reply_to_author_name=event.reply_to_author_name,
-                reply_to_is_own_message=event.reply_to_is_own_message, auto_skill=event.auto_skill,
-                channel_prompt=event.channel_prompt, channel_context=event.channel_context,
-                internal=event.internal, timestamp=event.timestamp,
-            ), adapter)
+            if getattr(adapter, "durable_intake", False) is True:
+                event.text = queued_text
+                queued_event = await self._adopt_resolved_llm_input(event)
+                if queued_event is None:
+                    return ""
+            else:
+                queued_event = MessageEvent(
+                    text=queued_text, message_type=event.message_type if has_media else MessageType.TEXT,
+                    source=event.source, raw_message=event.raw_message, message_id=event.message_id,
+                    media_urls=list(getattr(event, "media_urls", []) or []),
+                    media_types=list(getattr(event, "media_types", []) or []),
+                    media_text_inlined=list(getattr(event, "media_text_inlined", []) or []),
+                    reply_to_message_id=event.reply_to_message_id, reply_to_text=event.reply_to_text,
+                    reply_to_author_id=event.reply_to_author_id,
+                    reply_to_author_name=event.reply_to_author_name,
+                    reply_to_is_own_message=event.reply_to_is_own_message, auto_skill=event.auto_skill,
+                    channel_prompt=event.channel_prompt, channel_context=event.channel_context,
+                    internal=event.internal, timestamp=event.timestamp,
+                )
+            self._enqueue_fifo(quick_key, queued_event, adapter)
         depth = self._queue_depth(quick_key, adapter=adapter)
         return t("gateway.queue.queued") + (t("gateway.queue.queued_depth", depth=depth) if depth > 1 else "")
 
@@ -1067,6 +1093,13 @@ class GatewayBusySessionMixin:
         steer_text = event.get_command_args().strip()
         if not steer_text:
             return t("gateway.steer.usage")
+        adapter = self._delivery_adapter_for(source)
+        if getattr(adapter, "durable_intake", False) is True:
+            event.text = steer_text
+            queued_event = await self._adopt_resolved_llm_input(event)
+            if queued_event is not None:
+                self._enqueue_fifo(quick_key, queued_event, adapter)
+            return t("gateway.queue.queued") if queued_event is not None else ""
         _steer_state = self._peek_session_state(quick_key)
         running_agent = _steer_state.turn.agent if _steer_state else None
 

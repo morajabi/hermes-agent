@@ -195,6 +195,66 @@ not equate a consumed/dropped callback with acceptance. This receipt is separate
 from heartbeat execution accounting and does not bypass authorization, emergency
 stop, or later turn-preparation gates.
 
+### Opt-in durable receiving and public context
+
+An adapter with `durable_intake = True` requires capability version 1 and the
+actual runner-installed adoption, finish and drain callbacks before receiving.
+The adapter supplies an immutable physical event snapshot and a restorer that
+rechecks the current receiving account, source revision, visibility, recipient
+and actor authorization. A class constant or module import alone does not prove
+that this boundary is wired. Hosts without it can still load the plugin and use
+send-only delivery; receiving must refuse early. Non-opt-in platforms retain
+their existing queue and steering behavior.
+
+For conversational input, the runner checks admission and commits the frozen
+event to the receiving profile's existing `state.db` before transport ACK. The
+receipt records physical bot/chat/message/revision, canonical route and reset
+generation. Slash, skill and hook resolution freezes the admitted LLM text while
+retaining its physical source and arrival generation; recovery does not rerun
+command side effects. Busy receipt-bearing inputs use the existing FIFO as
+separate turns. On these adapters `/steer` queues the input for the next turn and
+reports that behavior; it does not steer the active provider through `steer(text)`.
+
+Controls remain synchronous and responsive without waiting on the intake lock.
+Their completion is distinct from durable conversational adoption, and they are
+not stored for destructive replay. Startup restoration defers fresh controls
+without ACK. Unavailable storage or temporary current-source proof leaves input
+retryable; a proven access, recipient, revision or reset mismatch is refused.
+Restored and queued inputs revalidate those gates before turn preparation.
+
+For opted-in receiving, `/stop` captures pending receipt IDs from the existing
+journal, including pre-provider input and overflow without an in-memory slot.
+It refuses only that captured pending cut; consumed input remains consumed and
+an arrival after the cut can start a new turn. Internal wakes survive. `/stop`
+does not reset the conversation generation. Shutdown cancellation releases
+pending work for recovery rather than silently treating it as stopped.
+
+The ordinary user-row transaction atomically consumes the intake receipt and
+the admitted public-context revisions before any provider request. Public chat
+messages are shared evidence, not another worker's private provider transcript
+or a grant of operator authority; carried historical mentions do not create new
+directions. Confirmed physical output identities distinguish ordinary responses
+already represented in the worker session from new public output, including cron
+briefs. Explicit reset advances the existing conversation generation and fences
+older queued inputs and automatic history ingestion.
+
+Only unconsumed intake can recover through the existing startup, reconnect and
+drain paths. A failed initial or queued preparation releases its still-pending
+dispatch claim on every return, error or cancellation. A failed oldest input
+also returns its promoted durable FIFO tail to the same journal. That turn skips
+immediate recovery to avoid a retry loop. A temporary oldest-source failure holds
+newer inputs in that route for the lifecycle pass; unrelated routes can proceed.
+If the release itself failed, later recovery can release an ownerless self-nonce
+claim, after excluding adoption-lock, live-task and queued/startup ownership.
+Recovery waits for a subsequent existing lifecycle or reconnect.
+The current user-notified context-reference policy refusal is terminal, while
+temporary preparation errors remain pending. After consumption, a provider crash
+or lost response does not cause automatic input replay: consumption, provider acceptance, completion and
+delivery are separate facts. This source contract requires each receiving
+profile's patched host, owned StateDB and fresh-source restorer. Focused offline
+tests qualify those paths; they do not establish live provider, installed-host,
+hard-kill or post-restart customer acceptance.
+
 ### Token Locks
 
 Adapters that connect with unique credentials call `acquire_scoped_lock()` in `connect()` and `release_scoped_lock()` in `disconnect()`. This prevents two profiles from using the same bot token simultaneously.

@@ -191,6 +191,12 @@ def _json_safe(value: Any) -> bool:
 
 def _serialise_value(value: Any) -> Optional[dict]:
     """Convert a pending message value to a JSON-serialisable dict."""
+    receipts = getattr(value, "_gateway_intake_receipts", ())
+    if (getattr(value, "_gateway_durable_adopted", False) is True
+            and isinstance(receipts, (tuple, list)) and receipts):
+        # Its immutable source is already in StateDB; plain-text spool replay
+        # would bypass current-source authorization/generation and duplicate it.
+        return None
     if hasattr(value, "text"):  # MessageEvent-like object
         result: Dict[str, Any] = {"text": getattr(value, "text", "")}
         for attr in ("session_id", "platform", "sender_id", "sender_name", "reply_to", "media",

@@ -2205,6 +2205,7 @@ from gateway.run_startup import GatewayStartupMixin
 from gateway.run_watchers import GatewaySessionWatchersMixin
 from gateway.run_notifications import GatewayNotificationsMixin
 from gateway.run_inbound import GatewayInboundMixin
+from gateway.run_intake import GatewayIntakeMixin
 from gateway.run_goals import GatewayGoalsMixin
 from gateway.run_agent_cache import GatewayAgentCacheMixin
 from gateway.run_profile_reconcile import GatewayProfileReconcileMixin
@@ -3379,7 +3380,7 @@ class GatewayRunner(
     GatewayVoiceMixin, GatewayAdapterLifecycleMixin, GatewayTopicThreadsMixin, GatewayTurnMixin,
     GatewayShutdownMixin, GatewayBusySessionMixin, GatewayConfigLoadersMixin, GatewayStartupMixin,
     GatewaySessionWatchersMixin, GatewayNotificationsMixin, GatewayInboundMixin, GatewayGoalsMixin,
-    GatewayAgentCacheMixin, GatewayProfileReconcileMixin, GatewayPluginRewireMixin):
+    GatewayAgentCacheMixin, GatewayProfileReconcileMixin, GatewayPluginRewireMixin, GatewayIntakeMixin):
     """Main gateway controller: manages adapter lifecycles, routes messages to/from the agent."""
 
     # Class-level defaults so partial construction in tests doesn't blow up on attribute access.
@@ -4281,7 +4282,10 @@ class GatewayRunner(
             message_id=str(context.source.message_id) if context.source.message_id else "",
             profile=getattr(context.source, "profile", "") or "",
             async_delivery=_async_delivery,
-            cron_session="")
+            cron_session="",
+            current_turn_source=(context.source
+                                 if getattr(context.source, "author_kind_verified", False) is True
+                                 else None))
 
     def _clear_session_env(self, tokens: list) -> None:
         """Restore session context variables to their pre-handler values."""

@@ -139,7 +139,12 @@ class GatewayInboundMixin:
             if _action == "rewrite":
                 _new_text = _result.get("text")
                 if isinstance(_new_text, str):
-                    event = dataclasses.replace(event, text=_new_text)
+                    if getattr(self._intake_adapter_for(source), "durable_intake", False) is True:
+                        # Keep physical transport disposition/verified actor on the
+                        # same event; the adapter freezes the original raw source.
+                        event.text = _new_text
+                    else:
+                        event = dataclasses.replace(event, text=_new_text)
                 break
             if _action == "allow":
                 break
@@ -203,7 +208,7 @@ class GatewayInboundMixin:
             await notifier.notify(self, source, hint)
 
     async def _hm_admit_event(
-        self, event: "MessageEvent"
+        self, event: "MessageEvent", *, intake: bool = False
     ) -> Optional[Tuple["MessageEvent", SessionSource, bool]]:
         """Ingress gates for ``_handle_message``; None when dropped, else ``(event, source, is_internal)``
         (the ``pre_gateway_dispatch`` hook may have rewritten ``event``)."""
@@ -256,6 +261,7 @@ class GatewayInboundMixin:
         if (
             getattr(self, "_startup_restore_in_progress", False)
             and not is_internal
+            and not intake
             and not getattr(event, "_hermes_startup_restore_replay", False)
         ):
             self._queue_startup_restore_event(event)
@@ -267,10 +273,19 @@ class GatewayInboundMixin:
         # scale-to-zero: only real user-originated inbound stamps the last-inbound clock;
         # counting internal/system events would keep a genuinely idle gateway awake.
         self._scale_to_zero_note_real_inbound()
-        event = await self._hm_pre_gateway_dispatch_hook(event, source)
-        if event is None:
-            return None
+        if not getattr(event, "_gateway_intake_prepared", False):
+            event = await self._hm_pre_gateway_dispatch_hook(event, source)
+            if event is None:
+                return None
         source = event.source
+
+        if not intake and getattr(event, "_gateway_intake_receipts", ()):
+            from gateway.run_intake import DurableIntakeRefused
+            try:
+                await self._validate_durable_intake_event(event)
+            except DurableIntakeRefused:
+                await self._refuse_durable_intake_event(event)
+                return None
 
         if not self._is_user_authorized_for_source(source):
             if source.user_id is None:
@@ -296,6 +311,7 @@ class GatewayInboundMixin:
         # The busy path charged this event on arrival; a drained follow-up must not pay twice.
         if not getattr(event, "_bot_loop_admitted", False) and not self._admit_bot_message_for_source(source):
             return None
+        event._bot_loop_admitted = True
         return event, source, False
 
     def _hm_estop_turn_allowed(self, event: "MessageEvent", source: SessionSource) -> bool:
@@ -646,6 +662,18 @@ class GatewayInboundMixin:
             # interrupt_then_dispatch / reject). Unrecognized commands and plain text fall through.
             return True, await self._dispatch_busy_slash_command(event, _cmd_def_inner, _quick_key, source)
 
+        if _evt_cmd and getattr(self._intake_adapter_for(source), "durable_intake", False) is True:
+            # Skill/plugin/quick commands must resolve before transport disposition:
+            # raw command text cannot be an acknowledged in-memory replay.
+            handled, result = await self._hm_dispatch_idle_commands(event, source, _quick_key)
+            if handled:
+                return True, result
+            resolved = await self._adopt_resolved_llm_input(event)
+            if resolved is not None:
+                self._queue_or_replace_pending_event(_quick_key, resolved)
+                return True, t("gateway.queue.queued")
+            return True, ""
+
         # Telegram photo bursts arrive as near-simultaneous updates — never interrupt for a
         # photo-only follow-up; adapter-level batching absorbs them.
         if event.message_type == MessageType.PHOTO:
@@ -729,6 +757,11 @@ class GatewayInboundMixin:
         """Fast-path while this session's agent is running: interrupt by default (minimal latency);
         busy_input_mode queue/steer, subagent and compression protection demote to queue."""
         from gateway.run import _AGENT_PENDING_SENTINEL
+        if getattr(event, "_gateway_durable_adopted", False) is True:
+            # A convergent receiver/direct handoff may bypass Base's busy FIFO.
+            # Physical receipts still require their own ordinary user-row turn.
+            self._queue_or_replace_pending_event(_quick_key, event)
+            return None
         _handled, _result = await self._hm_busy_slash_or_photo(event, source, _quick_key)
         if _handled:
             return _result
@@ -1317,6 +1350,7 @@ class GatewayInboundMixin:
         if _admitted is None:
             return None
         event, source, is_internal = _admitted
+        intake_control = getattr(event, "_gateway_intake_control", False) is True
         if not is_internal:
             from hermes_cli.observability.shared_metrics_events import record_gateway_slash_command
             record_gateway_slash_command(event)
@@ -1348,6 +1382,16 @@ class GatewayInboundMixin:
         _handled, _result = await self._hm_dispatch_idle_commands(event, source, _quick_key)
         if _handled:
             return _result
+        event = await self._adopt_resolved_llm_input(event)
+        if event is None:
+            return None
+        source = event.source
+        if intake_control and getattr(event, "_gateway_durable_adopted", False) is True:
+            # The synchronous control owner only resolved/adopted this command.
+            # Hand model work back to Base's ordinary FIFO/background lifecycle
+            # so transport ACK and new approvals do not await provider execution.
+            self._enqueue_fifo(_quick_key, event, self._intake_adapter_for(source))
+            return None
 
         # Pending exec approvals go through /approve and /deny only — no bare-text matching, or a
         # conversational "yes" would execute a dangerous command.

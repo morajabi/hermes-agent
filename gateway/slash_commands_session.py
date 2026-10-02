@@ -180,7 +180,12 @@ class GatewaySessionCommandsMixin:
                                   parent_session_id=str(getattr(old_entry, "session_id", "") or ""))
         _reset_process_scoped_tool_state()
 
-        new_entry = await self.async_session_store.reset_session(session_key)
+        boundary_fn = getattr(self._delivery_adapter_for(source), "public_context_reset_boundary", None)
+        boundary = boundary_fn(event) if callable(boundary_fn) else None
+        if boundary is not None:
+            boundary = {**boundary, "source": source.platform.value}
+        reset_kwargs = {"public_context_boundary": boundary} if boundary is not None else {}
+        new_entry = await self.async_session_store.reset_session(session_key, **reset_kwargs)
         _old_sid = old_entry.session_id if old_entry else None
         await self._fire_session_reset_hooks(source, session_key, _old_sid,
                                              new_entry.session_id if new_entry else None)

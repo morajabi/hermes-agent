@@ -36,6 +36,7 @@ def _origin_user_id(entry: dict) -> str:
 def mirror_to_session(
     platform: str, chat_id: str, message_text: str, source_label: str = "cli", thread_id: Optional[str] = None,
     user_id: Optional[str] = None, role: str = "assistant", session_id: Optional[str] = None,
+    *, session_store=None, source=None,
 ) -> bool:
     """Append a delivery-mirror message to the target session's SQLite transcript.
 
@@ -53,6 +54,14 @@ def mirror_to_session(
     mirrored text is the agent's own outgoing reply (a genuine assistant turn). See #2221.
     """
     try:
+        from gateway.platform_registry import platform_registry
+        entry = platform_registry.get(platform)
+        if entry is not None and entry.public_context_admission_enabled is True:
+            return False
+        if session_store is not None:
+            if source is None:
+                return False
+            return session_store.append_delivery_to_session(source, message_text, role=role)
         if not session_id:
             session_id = _find_session_id(platform, str(chat_id), thread_id=thread_id, user_id=user_id)
         if not session_id:

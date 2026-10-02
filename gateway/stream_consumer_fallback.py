@@ -231,6 +231,7 @@ class StreamFallbackMixin:
         result = None
         for attempt in range(2):
             result = await self.adapter.send(**kwargs)
+            self._track_delivered_result(result)
             if getattr(result, "success", False):
                 break
             retry_delay = self._fallback_flood_retry_delay(result)
@@ -327,6 +328,7 @@ class StreamFallbackMixin:
             _md = dict(self.metadata) if self.metadata else {}
             _md["_interim_send"] = True
             result = await self.adapter.send(chat_id=self.chat_id, content=tail, metadata=_md)
+            self._track_delivered_result(result)
             if result.success:
                 self._already_sent = True
         except Exception as e:
@@ -361,6 +363,7 @@ class StreamFallbackMixin:
             result = await self.adapter.send(
                 chat_id=self.chat_id, content=text,
                 reply_to=self._initial_reply_to_id if _needs_reply_anchor else None, metadata=_md)
+            self._track_delivered_result(result)
             # Do NOT set _already_sent: commentary is interim, and the flag would
             # suppress the real final after multiple tool calls.
             if result.success:

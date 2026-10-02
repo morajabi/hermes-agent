@@ -539,8 +539,39 @@ CREATE TABLE IF NOT EXISTS conversation_generations (
     source TEXT NOT NULL,
     session_key TEXT NOT NULL,
     generation INTEGER NOT NULL DEFAULT 0,
+    public_context_floor TEXT,
     PRIMARY KEY (source, session_key)
 );
+
+-- Public message revisions admitted to a bot's private conversation. Compression
+-- rotates sessions without rotating this key. Reset generations remain separate.
+CREATE TABLE IF NOT EXISTS public_context_receipts (
+    source TEXT NOT NULL,
+    session_key TEXT NOT NULL,
+    generation INTEGER NOT NULL,
+    chat_id TEXT NOT NULL,
+    message_id TEXT NOT NULL,
+    revision TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    PRIMARY KEY (source, session_key, generation, chat_id, message_id, revision)
+);
+
+-- Opted-in transport ACKs adopt immutable authorized inputs. Only the ordinary
+-- user-row transaction consumes them; reset uses conversation_generations.
+CREATE TABLE IF NOT EXISTS gateway_intake (
+    receipt_id TEXT PRIMARY KEY,
+    source TEXT NOT NULL,
+    session_key TEXT NOT NULL,
+    generation INTEGER NOT NULL,
+    owner_json TEXT NOT NULL,
+    snapshot_json TEXT NOT NULL,
+    state TEXT NOT NULL DEFAULT 'pending',
+    dispatch_owner TEXT,
+    consumed_session_id TEXT,
+    created_at REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_gateway_intake_pending
+    ON gateway_intake (session_key, generation) WHERE state = 'pending';
 
 -- Per-backend liveness heartbeat (#94895). Each serve / tui_gateway process
 -- registers a row at startup and refreshes ``last_heartbeat`` periodically.

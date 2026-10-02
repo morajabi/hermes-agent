@@ -347,7 +347,8 @@ class GatewayNotificationsMixin:
         return switched
 
     async def _deliver_media_from_response(
-        self, response: str, event: MessageEvent, adapter, thread_metadata: Optional[Dict[str, Any]] = None
+        self, response: str, event: MessageEvent, adapter, thread_metadata: Optional[Dict[str, Any]] = None,
+        delivered_message_ids=None,
     ) -> None:
         """Deliver explicit MEDIA: tags from an already-streamed response (text already delivered).
         EXPLICIT-ONLY, unlike the non-streaming path in ``gateway/platforms/base.py``: a bare local
@@ -390,20 +391,30 @@ class GatewayNotificationsMixin:
             if image_paths:
                 try:
                     images = [(f"file://{_quote(p)}", "") for p in image_paths]
-                    await adapter.send_multiple_images(chat_id=chat_id, images=images, metadata=_thread_meta)
+                    result = await adapter.send_multiple_images(chat_id=chat_id, images=images, metadata=_thread_meta)
+                    if delivered_message_ids is not None:
+                        from gateway.public_context import public_send_ids
+                        delivered_message_ids.extend(public_send_ids(result))
+                    from gateway.public_context import record_event_delivery
+                    await record_event_delivery(self, event, adapter, result)
                 except Exception as e:
                     logger.warning("[%s] Post-stream image batch delivery failed: %s", adapter.name, e)
             for media_path, is_voice in non_image_media:
                 try:
                     ext = Path(media_path).suffix.lower()
                     if should_send_media_as_audio(event.source.platform, ext, is_voice=is_voice):
-                        await adapter.send_voice(
+                        result = await adapter.send_voice(
                             chat_id=chat_id, audio_path=media_path, metadata=_thread_meta, is_voice=is_voice,
                         )
                     elif ext in _VIDEO_EXTS:
-                        await adapter.send_video(chat_id=chat_id, video_path=media_path, metadata=_thread_meta)
+                        result = await adapter.send_video(chat_id=chat_id, video_path=media_path, metadata=_thread_meta)
                     else:
-                        await adapter.send_document(chat_id=chat_id, file_path=media_path, metadata=_thread_meta)
+                        result = await adapter.send_document(chat_id=chat_id, file_path=media_path, metadata=_thread_meta)
+                    if delivered_message_ids is not None:
+                        from gateway.public_context import public_send_ids
+                        delivered_message_ids.extend(public_send_ids(result))
+                    from gateway.public_context import record_event_delivery
+                    await record_event_delivery(self, event, adapter, result)
                 except Exception as e:
                     logger.warning("[%s] Post-stream media delivery failed: %s", adapter.name, e)
 
@@ -413,6 +424,7 @@ class GatewayNotificationsMixin:
         metadata: Optional[Dict[str, Any]] = None, event_message_id: Optional[str] = None,
         text_already_delivered: bool = False, deliver_media: bool = True, stream_consumer=None,
         session_key: Optional[str] = None, inbound_message_id: Optional[str] = None,
+        delivered_message_ids=None,
     ) -> bool:
         """Deliver a queued response using the normal text+attachment split.
 
@@ -444,6 +456,8 @@ class GatewayNotificationsMixin:
                             chat_id=source.chat_id, message_id=_sc_msg_id, content=text_content, finalize=True,
                         )
                         if getattr(_edit_res, "success", False):
+                            if delivered_message_ids is not None:
+                                delivered_message_ids.append(str(_sc_msg_id))
                             _reconciled = True
                             logger.info(
                                 "Queued-lane final reconciled by editing message %s in place (no duplicate send).",
@@ -473,6 +487,9 @@ class GatewayNotificationsMixin:
                         # the caller's normal completion send replays the whole response (text and
                         # its MEDIA: tags), so uploading here would duplicate every file.
                         return False
+                    if delivered_message_ids is not None:
+                        from gateway.public_context import public_send_ids
+                        delivered_message_ids.extend(public_send_ids(_sent))
         # Failed turns deliver their (normalized failure) text but must not upload attachments as if
         # they succeeded — mirrors the ``not agent_result.get("failed")`` completed-turn guard.
         if not deliver_media:
@@ -480,6 +497,7 @@ class GatewayNotificationsMixin:
         await self._deliver_media_from_response(
             response, MessageEvent(text="", source=source, message_id=event_message_id), adapter,
             thread_metadata=metadata,
+            delivered_message_ids=delivered_message_ids,
         )
         return True
 

@@ -56,6 +56,16 @@ _SESSION_ASYNC_DELIVERY = ContextVar("HERMES_SESSION_ASYNC_DELIVERY", default=_U
 # or child-process export: a bound id alone cannot authorize detached delivery.
 _SESSION_HISTORY_DELIVERY = ContextVar("HERMES_SESSION_HISTORY_DELIVERY", default=_UNSET)
 
+# Actual verified current-turn actor; never a model argument, old origin, env
+# fallback or subprocess export. A new binding/clear/reset drops this proof.
+_SESSION_TURN_SOURCE = ContextVar("HERMES_CURRENT_TURN_SOURCE", default=None)
+
+
+def get_current_turn_source():
+    """Native verified actor for this bound turn, or None (unknown/CLI/cron)."""
+    source = _SESSION_TURN_SOURCE.get()
+    return source if getattr(source, "author_kind_verified", False) is True else None
+
 # Cron auto-delivery vars, set per-job in run_job() so concurrent jobs don't clobber.
 _CRON_AUTO_DELIVER_PLATFORM = ContextVar("HERMES_CRON_AUTO_DELIVER_PLATFORM", default=_UNSET)
 _CRON_AUTO_DELIVER_CHAT_ID = ContextVar("HERMES_CRON_AUTO_DELIVER_CHAT_ID", default=_UNSET)
@@ -120,6 +130,7 @@ def set_session_vars(
     browser_control_transport_family: str = "", cwd: str = "", async_delivery: bool = True,
     ui_session_id: str = "", cron_session: Any = _UNSET, parent_chat_id: str = "",
     session_history_delivery: str | None = None,
+    current_turn_source: Any = None,
 ) -> list:
     """Set all session context variables and return reset tokens.  Call
     ``clear_session_vars(tokens)`` in a ``finally``; not nestable, clearing resets every var
@@ -140,6 +151,12 @@ def set_session_vars(
     tokens = [var.set(value) for var, value in zip(_SESSION_VARS, values)]
     tokens.append(_SESSION_ASYNC_DELIVERY.set(bool(async_delivery)))
     tokens.append(_SESSION_HISTORY_DELIVERY.set(_UNSET if session_history_delivery is None else session_history_delivery))
+    if getattr(current_turn_source, "author_kind_verified", False) is True:
+        from gateway.session_identity import replace_source
+        current_turn_source = replace_source(current_turn_source)
+    else:
+        current_turn_source = None
+    tokens.append(_SESSION_TURN_SOURCE.set(current_turn_source))
     _runtime_cwd("set_session_cwd", cwd)
     return tokens
 
@@ -154,6 +171,7 @@ def clear_session_vars(tokens: list) -> None:
         var.set("")
     _SESSION_ASYNC_DELIVERY.set(_UNSET)
     _SESSION_HISTORY_DELIVERY.set(_UNSET)
+    _SESSION_TURN_SOURCE.set(None)
     _runtime_cwd("clear_session_cwd")
 
 
@@ -167,6 +185,7 @@ def reset_session_vars() -> None:
         var.set(_UNSET)
     _SESSION_ASYNC_DELIVERY.set(_UNSET)
     _SESSION_HISTORY_DELIVERY.set(_UNSET)
+    _SESSION_TURN_SOURCE.set(None)
     _runtime_cwd("clear_session_cwd")
 
 

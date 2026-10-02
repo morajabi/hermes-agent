@@ -1911,11 +1911,15 @@ class BasePlatformAdapter(ABC):
     # Back-reference to the running ``GatewayRunner`` (set by gateway/run.py); ``build_source``
     # resolves the inbound profile via ``runner._profile_name_for_source``.
     gateway_runner = None  # type: ignore[assignment]
+    # Opt-in adapters require these runner callbacks before receiving traffic.
+    durable_intake_version = 1
+    durable_intake = False
 
     def __init__(self, config: PlatformConfig, platform: Platform):
         self.config = config
         self.platform = platform
         self._message_handler: Optional[MessageHandler] = None
+        self._durable_intake_handler = self._durable_intake_finish = self._durable_intake_drain = None
         self._no_message_handler_logged: bool = False
         self._reaction_handler: Optional[Callable[[Dict[str, Any]], Awaitable[None]]] = None
         # Runner-owned boundary for normalized events: auth/profile state never lives in an adapter.
@@ -2345,6 +2349,10 @@ class BasePlatformAdapter(ABC):
         """Set an optional handler for messages arriving during active sessions."""
         self._busy_session_handler = handler
 
+    def set_durable_intake_handler(self, handler, *, finish, drain) -> None:
+        """Host-owned immutable adoption and existing post-turn recovery boundary."""
+        self._durable_intake_handler, self._durable_intake_finish, self._durable_intake_drain = handler, finish, drain
+
     def set_reaction_handler(self, handler: Optional[Callable[[Dict[str, Any]], Awaitable[None]]]) -> None:
         """Set the handler for platform-native emoji-reaction events: a normalised dict
         (``platform``, ``event_name`` "reaction:added"/"reaction:removed", ``reaction``,
@@ -2509,6 +2517,13 @@ class BasePlatformAdapter(ABC):
 
     def _source_session_key(self, source: "SessionSource") -> str:
         self._canonicalize(source)  # identity FIRST; no key derivation before it
+        if self.durable_intake is True:
+            store = getattr(self, "_session_store", None)
+            generate = getattr(store, "_generate_session_key", None)
+            if callable(generate):
+                # Durable routes and FIFO guards must use the same state owner,
+                # including current per-user/shared-history policy.
+                return generate(source)
         extra = self.config.extra
         return build_session_key(
             source, group_sessions_per_user=extra.get("group_sessions_per_user", True),
@@ -3553,6 +3568,9 @@ class BasePlatformAdapter(ABC):
         ephemeral deletion — no session lifecycle (active-session bypass paths)."""
         thread_meta = _thread_metadata_for_event(event)
         response = await self._message_handler(event)
+        if event._gateway_intake_control:
+            # Control execution completed even if its reply subsequently fails to send.
+            event._gateway_intake_control_completed = True
         text, eph_ttl = self._unwrap_ephemeral(response)
         if not text:
             return
@@ -3903,6 +3921,8 @@ class BasePlatformAdapter(ABC):
         guard = interrupt_event or asyncio.Event()
         self._active_sessions[session_key] = guard
         task = asyncio.create_task(self._process_message_background(event, session_key))
+        if isinstance(task, asyncio.Task):
+            task._gateway_intake_event = event
         if not self._track_session_task(session_key, task):
             self._session_tasks.pop(session_key, None)
             self._release_session_guard(session_key, guard=guard)
@@ -3967,12 +3987,17 @@ class BasePlatformAdapter(ABC):
         drain once."""
         logger.debug("[%s] Command '/%s' bypassing active-session guard for %s", self.name, cmd, session_key)
         current_guard = self._active_sessions.get(session_key)
+        interrupted_task = self._session_tasks.get(session_key)
         command_guard = asyncio.Event()
         self._active_sessions[session_key] = command_guard
         try:
             # Send BEFORE cancelling so cancellation side effects can't drop the "/new"
             # confirmation.
             await self._dispatch_inline_reply(event, log_cmd=cmd)
+            if interrupted_task is not None and not interrupted_task.done():
+                # Explicit controls stop pre-provider adopted input too. Shutdown
+                # cancellation does not set this process-local task provenance.
+                interrupted_task._gateway_intake_stop_requested = True
             await self.cancel_session_processing(session_key, release_guard=False, discard_pending=False)
         except Exception:
             # On failure restore the original guard so the session isn't left half-reset.
@@ -4017,11 +4042,55 @@ class BasePlatformAdapter(ABC):
             logger.warning("Dropping internally routed event: expected session=%s derived=%s",
                            expected_session_key, session_key)
             return
+        if self.durable_intake is True:
+            if not callable(self._durable_intake_handler):
+                raise RuntimeError("receiving adapter requires the host durable intake boundary")
+            lock = self.gateway_runner._intake_lock_for_event(event)
+            async with lock if lock is not None else contextlib.nullcontext():
+                await self._adopt_and_dispatch_durable(event)
+            return
+        await self._dispatch_admitted_message(event, session_key)
+
+    async def _adopt_and_dispatch_durable(self, event: MessageEvent) -> None:
+        """Durable adoption and lane handoff under the existing route's intake lock."""
+        try:
+            from gateway.run_intake import DurableIntakeRefused
+            adopted = await self._durable_intake_handler(event)
+        except DurableIntakeRefused:
+            event._gateway_intake_refused = True
+            return
+        else:
+            if adopted is None:
+                return  # already adopted/consumed; never release the current dispatch claim
+            event = adopted
+            session_key = self._event_session_key(event)
+        try:
+            await self._dispatch_admitted_message(event, session_key)
+        finally:
+            if self.durable_intake is True and callable(self._durable_intake_finish):
+                await self._durable_intake_finish(event)
+
+    async def _dispatch_admitted_message(self, event: MessageEvent, session_key: str) -> None:
+        """Claim the existing lane only after opt-in durable adoption."""
         # On-entry self-heal: clear a guard whose owner task already exited.
         if session_key in self._active_sessions:
             self._heal_stale_session_lock(session_key)
         if session_key in self._active_sessions:
             await self._handle_message_while_active(event, session_key)
+            return
+        if event._gateway_intake_control:
+            # No destructive-control replay. Await the normal control handler before
+            # returning a transport disposition, keeping concurrent inputs queued.
+            guard = asyncio.Event()
+            self._active_sessions[session_key] = guard
+            owner_task = asyncio.current_task()
+            self._session_tasks[session_key] = owner_task
+            try:
+                await self._dispatch_inline_reply(event)
+            finally:
+                if self._session_tasks.get(session_key) is owner_task:
+                    self._session_tasks.pop(session_key, None)
+                await self._drain_pending_after_session_command(session_key, guard)
             return
         # Guard installed synchronously BEFORE the task spawns so a second message can't race in.
         event._gateway_accepted = self._start_session_processing(event, session_key)
@@ -4039,7 +4108,7 @@ class BasePlatformAdapter(ABC):
         self._canonicalize(event.source)  # identity FIRST (direct callers may skip handle_message)
         cmd = event.get_command()
         from hermes_cli.commands import (is_interrupt_then_dispatch, should_bypass_active_session)
-        if should_bypass_active_session(cmd):
+        if should_bypass_active_session(cmd) or (cmd and event._gateway_intake_control):
             try:
                 # /stop, /new, /reset: cancel + response + drain; other bypasses don't cancel.
                 if cmd and is_interrupt_then_dispatch(cmd):
@@ -4094,6 +4163,12 @@ class BasePlatformAdapter(ABC):
                     return
             if handled:
                 return
+        if event._gateway_intake_receipts:
+            # A failed/declined busy handoff must retain each physical input.
+            # The wrapper releases its claim for the existing durable drain;
+            # legacy text/photo merging would consume only one sibling receipt.
+            event._gateway_accepted = False
+            return
         # Without a runner FIFO, do not merge a wake into an occupied human slot
         # (or collapse distinct wakes into one turn). Its caller can retry admission.
         if event.internal and session_key in self._pending_messages:
@@ -4491,12 +4566,16 @@ class BasePlatformAdapter(ABC):
     async def _process_message_background(self, event: MessageEvent, session_key: str) -> None:
         """Background task that actually processes the message."""
         delivery_attempted = delivery_succeeded = False  # feeds the processing-complete hook
+        public_output_ids = []
+        intake_failed = False
 
         def _record_delivery(result):
             nonlocal delivery_attempted, delivery_succeeded
             if result is not None:
                 delivery_attempted = True
                 delivery_succeeded = delivery_succeeded or bool(getattr(result, "success", False))
+                from gateway.public_context import public_send_ids
+                public_output_ids.extend(public_send_ids(result))
         # Reuse the interrupt event handle_message() installed; new Event only if removed externally.
         interrupt_event = self._active_sessions.get(session_key) or asyncio.Event()
         self._active_sessions[session_key] = interrupt_event
@@ -4506,6 +4585,7 @@ class BasePlatformAdapter(ABC):
             await self._run_processing_hook("on_processing_start", event)
             event._turn_marker_handoff = self.gateway_runner is not None  # it can release the marker
             response = await self._message_handler(event)
+            intake_failed = bool(getattr(asyncio.current_task(), "_gateway_intake_recovery_deferred", False))
             # A muted diagnostic wake ran for the session; its reply is not presented. The
             # policy read binds the routed profile; delivery itself stays in the launch scope.
             with self._media_delivery_scope(event.source):
@@ -4593,6 +4673,7 @@ class BasePlatformAdapter(ABC):
                 ProcessingOutcome.CANCELLED if expected else ProcessingOutcome.FAILURE)
             raise
         except BaseException as e:
+            intake_failed = bool(event._gateway_intake_receipts)
             await self._run_processing_hook("on_processing_complete", event, ProcessingOutcome.FAILURE)
             logger.error("[%s] Error handling message: %s", self.name, e, exc_info=True)
             _thread_metadata = (await self._notify_turn_error(event, e)) or _thread_metadata
@@ -4600,18 +4681,40 @@ class BasePlatformAdapter(ABC):
             if isinstance(e, (SystemExit, KeyboardInterrupt)):
                 raise
         finally:
-            await self._release_turn_marker(event)
-            event._turn_marker_handoff = False  # a later run of this object clears its own marker
-            # Stop typing BEFORE the post-delivery callback: a stuck callback must not keep it
-            # alive.
-            await self._stop_typing_refresh(event.source.chat_id, typing_task, metadata=_thread_metadata)
-            await self._fire_post_delivery_callback(session_key, interrupt_event)
-            # Callback work or a late refresh may have recreated typing — one final bounded stop.
-            await self._stop_typing_refresh(
-                event.source.chat_id, None, metadata=_thread_metadata, stop_attempts=1)
-            # Flush any timer that missed the in-band drain, then reconcile ownership.
-            await self._flush_text_debounce_now(session_key)
-            self._finish_session_task(session_key, interrupt_event)
+            try:
+                # Confirmed sends remain this turn's output even when a later
+                # attachment/pacing await is cancelled. Persist their identities
+                # before any other cleanup awaits; lookup failure retains a
+                # pending receipt and never resends the already delivered body.
+                if getattr(event, "_public_context", None):
+                    from gateway.public_context import record_public_delivery
+                    await record_public_delivery(
+                        self.gateway_runner.session_store, self._final_delivery_adapter(event.source), event.source,
+                        event._public_context_session_id, event._public_context, public_output_ids)
+            finally:
+                if callable(self._durable_intake_finish):
+                    try:
+                        intake_failed = await self._durable_intake_finish(event, turn_complete=True) or intake_failed
+                    except Exception:
+                        intake_failed = True
+                        logger.warning("[%s] Durable input turn settlement deferred", self.name, exc_info=True)
+                await self._release_turn_marker(event)
+                event._turn_marker_handoff = False  # a later run of this object clears its own marker
+                # Stop typing BEFORE the post-delivery callback: a stuck callback must not keep it
+                # alive.
+                await self._stop_typing_refresh(event.source.chat_id, typing_task, metadata=_thread_metadata)
+                await self._fire_post_delivery_callback(session_key, interrupt_event)
+                # Callback work or a late refresh may have recreated typing — one final bounded stop.
+                await self._stop_typing_refresh(
+                    event.source.chat_id, None, metadata=_thread_metadata, stop_attempts=1)
+                # Flush any timer that missed the in-band drain, then reconcile ownership.
+                await self._flush_text_debounce_now(session_key)
+                self._finish_session_task(session_key, interrupt_event)
+                if not intake_failed and callable(self._durable_intake_drain):
+                    try:
+                        await self._durable_intake_drain(session_key)
+                    except Exception:
+                        logger.warning("[%s] Durable input drain deferred", self.name, exc_info=True)
 
     _REQUEUE_BACKOFF_INITIAL_SECONDS = 0.25
     # Kept at 1s: nothing wakes the back-off sleep, so a genuine message merged into the slot
@@ -4660,9 +4763,11 @@ class BasePlatformAdapter(ABC):
         # Capture the guard this drain owns now: a /stop//new guard swapped in during the
         # back-off must survive the slot-empty exit (#48300).
         guard = self._active_sessions.get(session_key)
+        task = asyncio.create_task(self._drain_after(pending_event, session_key, delay, guard))
+        if isinstance(task, asyncio.Task):
+            task._gateway_intake_event = pending_event
         self._track_session_task(
-            session_key,
-            asyncio.create_task(self._drain_after(pending_event, session_key, delay, guard)))
+            session_key, task)
 
     async def _drain_after(self, pending_event: MessageEvent, session_key: str, delay: float,
                            guard: Optional[asyncio.Event]) -> None:

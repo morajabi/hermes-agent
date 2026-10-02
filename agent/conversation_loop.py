@@ -1620,8 +1620,13 @@ def _run_conversation_turn(
     # Opt-in runtime: api_mode == codex_app_server hands the whole turn to the codex
     # app-server subprocess (see agent/transports/codex_app_server_session.py).
     if agent.api_mode == "codex_app_server":
+        codex_user_message = s.user_message
+        if 0 <= s.current_turn_user_idx < len(s.messages):
+            current = s.messages[s.current_turn_user_idx]
+            if (current.get("display_metadata") or {}).get("public_context"):
+                codex_user_message = current.get("api_content") or current.get("content")
         codex_result = agent._run_codex_app_server_turn(
-            user_message=s.user_message, original_user_message=s.original_user_message,
+            user_message=codex_user_message, original_user_message=s.original_user_message,
             messages=s.messages, effective_task_id=s.effective_task_id,
             should_review_memory=s._should_review_memory,
         )

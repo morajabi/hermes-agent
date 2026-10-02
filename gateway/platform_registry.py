@@ -94,6 +94,13 @@ class PlatformEntry:
     # and never under a multiplexed secondary's scope; a hand-rolled ``os.environ[...] =`` is
     # first-profile-wins. Contract: docs/developer-guide/adding-platform-adapters.md.
     apply_yaml_config_fn: Optional[Callable[[dict, dict], Optional[dict]]] = None
+    # Opt-in canonical continuation: async (adapter, chat_id, *, thread_id, user_id,
+    # chat_name, scope_id) -> SessionSource | None. None on the entry preserves the
+    # platform's existing mirror behavior; opted-in cold delivery fails closed.
+    delivery_source_resolver: Optional[Callable[..., Any]] = None
+    # Ordinary input admission owns public-log context, including standalone
+    # sends. These platforms must not use legacy transcript mirroring.
+    public_context_admission_enabled: bool = False
     cron_deliver_env_var: str = ""  # home-channel env var read for cron ``deliver=<name>``
     # ``(target_ref) -> Optional[(chat_id, thread_id)]`` run before channel-directory
     # fallback so plugins can declare native target syntax; None = continue resolution.

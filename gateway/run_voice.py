@@ -393,5 +393,7 @@ class GatewayVoiceMixin:
         thread_meta = dict(self._thread_metadata_for_source(event.source, reply_anchor) or {})
         thread_meta["notify"] = True
         for path in audio_paths:
-            await send_voice(chat_id=event.source.chat_id, audio_path=path, reply_to=reply_anchor,
+            result = await send_voice(chat_id=event.source.chat_id, audio_path=path, reply_to=reply_anchor,
                              metadata=thread_meta)
+            from gateway.public_context import record_event_delivery
+            await record_event_delivery(self, event, adapter, result)
