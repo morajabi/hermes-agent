@@ -47,8 +47,10 @@ from cron.jobs import (
 from tools.cronjob_prompt_scan import _scan_cron_prompt
 from tools.cronjob_job_args import (
     _apply_continuity,
+    _authorize_job_public_context,
     _canonical_skills,
     _clean_str_list,
+    _cron_execution_scope,
     _format_job,
     _gateway_liveness_notice,
     _local_delivery_notice,
@@ -521,6 +523,7 @@ def _manual_run_completion(
 
 def _try_dispatch_background_run(
     job: Dict[str, Any], session_id: Optional[str] = None, extra_prompt: Optional[str] = None,
+    *, completion_home: Optional[Path] = None,
 ) -> Optional[Dict[str, Any]]:
     """Claim ``job`` now (SYNCHRONOUSLY, so unrunnable jobs report immediately), then fire it
     on the async-delegation executor like ``delegate_task``'s background mode: the tool returns
@@ -585,29 +588,52 @@ def _try_dispatch_background_run(
         result["dispatched"] = False
         return result
 
-    try:
-        from tools.delegate_tool import _get_max_async_children
-        max_async = _get_max_async_children()
-    except Exception:
-        max_async = 3
-
     started_at = time.time()
     # Scheduler's own normalizer (falsy -> "local", list -> comma string) on the claimed snapshot.
     from cron.scheduler import _normalize_deliver_value
     deliver = _normalize_deliver_value(claimed_job.get("deliver", "local"))
 
-    def _runner() -> Dict[str, Any]:
-        res = _run_claimed_job(claimed_job, extra_prompt=extra_prompt)
-        return _manual_run_completion(res, job_id, job_name, deliver, started_at)
+    execution_home = None
+    if completion_home is not None:
+        from hermes_constants import get_hermes_home
+        execution_home = get_hermes_home().resolve()
 
-    dispatch = dispatch_async_delegation(
-        goal=f"Manual run of cron job '{job_name}' ({job_id})",
-        context=("Triggered via cronjob(action='run'). The job executed in its own "
-                 "fresh cron session; this block reports its outcome."),
-        toolsets=None, role="cron_run", model=job.get("model"), session_key=session_key,
-        parent_session_id=str(session_id) if session_id else None, runner=_runner,
-        origin_ui_session_id=origin_ui_session_id, origin_session_id=origin_session_id,
-        max_async_children=max_async)
+    def _runner() -> Dict[str, Any]:
+        with contextlib.ExitStack() as scope:
+            if execution_home is not None:
+                from cron.jobs import use_cron_store
+                from gateway.run import _profile_runtime_scope
+
+                scope.enter_context(_profile_runtime_scope(execution_home))
+                scope.enter_context(use_cron_store(execution_home))
+            res = _run_claimed_job(claimed_job, extra_prompt=extra_prompt)
+            return _manual_run_completion(res, job_id, job_name, deliver, started_at)
+
+    def dispatch_to_creator():
+        # The completion ledger belongs to the actual caller's session store.
+        # Only the execution closure enters the worker's runtime and cron store.
+        try:
+            from tools.delegate_tool import _get_max_async_children
+            caller_max_async = _get_max_async_children()
+        except Exception:
+            caller_max_async = 3
+        return dispatch_async_delegation(
+            goal=f"Manual run of cron job '{job_name}' ({job_id})",
+            context=("Triggered via cronjob(action='run'). The job executed in its own "
+                     "fresh cron session; this block reports its outcome."),
+            toolsets=None, role="cron_run", model=job.get("model"), session_key=session_key,
+            parent_session_id=str(session_id) if session_id else None, runner=_runner,
+            origin_ui_session_id=origin_ui_session_id, origin_session_id=origin_session_id,
+            max_async_children=caller_max_async)
+
+    if completion_home is None:
+        dispatch = dispatch_to_creator()
+    else:
+        from cron.jobs import use_cron_store
+        from gateway.run import _profile_runtime_scope
+
+        with _profile_runtime_scope(completion_home), use_cron_store(completion_home):
+            dispatch = dispatch_to_creator()
     if dispatch.get("status") == "dispatched":
         return {"claimed": True, "dispatched": True, "delegation_id": dispatch.get("delegation_id")}
 
@@ -615,7 +641,7 @@ def _try_dispatch_background_run(
     logger.info(
         "cronjob run: background pool unavailable (%s); running job '%s' inline.",
         dispatch.get("error", "rejected"), job_name)
-    result = _run_claimed_job(job, extra_prompt=extra_prompt)
+    result = _run_claimed_job(claimed_job, extra_prompt=extra_prompt)
     result["dispatched"] = False
     return result
 
@@ -677,7 +703,7 @@ def _action_create(a: Dict[str, Any]) -> str:
         job = create_job_with_scheduler_registration(
             prompt=prompt or "", schedule=a["schedule"], name=a["name"], repeat=a["repeat"],
             deliver=_resolve_cron_context_deliver(deliver),
-            origin=_origin_from_env(a["schedule"]),
+            origin=a["_captured_origin"] if "_captured_origin" in a else _origin_from_env(a["schedule"]),
             skills=canonical_skills,
             model=_normalize_optional_job_value(a["model"]), provider=_normalize_optional_job_value(a["provider"]),
             base_url=_normalize_optional_job_value(a["base_url"], strip_trailing_slash=True),
@@ -690,10 +716,13 @@ def _action_create(a: Dict[str, Any]) -> str:
             reasoning_effort=a["reasoning_effort"], interpreter=a["interpreter"],
             pinned=bool(a["pinned"]),
             failure_deliver=_resolve_cron_context_deliver(_normalize_deliver_param(a["failure_deliver"])),
+            **({"public_task_context": a["public_task_context"]} if a.get("public_task_context") is not None else {}),
             **({"paused": a["paused"], "paused_reason": a["paused_reason"]}
                if a["paused"] is not False or a["paused_reason"] is not None else {}))
     except CronSchedulerRegistrationError as exc:
         _partial = exc.to_dict()
+        if a.get("execute_as") is not None:
+            _partial["execute_as"] = a["execute_as"]
         return tool_error(_partial.pop("error"), success=False, **_partial)
     _create_message = " ".join(filter(None, (f"Cron job '{job['name']}' created.",
         "Created PAUSED — resume to schedule, or explicitly run now." if not job.get("enabled", True) else None,
@@ -710,7 +739,10 @@ def _action_create(a: Dict[str, Any]) -> str:
 
 
 def _action_list(a: Dict[str, Any]) -> str:
-    jobs = [_format_job(job) for job in list_jobs(include_disabled=a["include_disabled"])]
+    stored_jobs = list_jobs(include_disabled=a["include_disabled"])
+    for job in stored_jobs:
+        _authorize_job_public_context(job)
+    jobs = [_format_job(job) for job in stored_jobs]
     _result = {"success": True, "count": len(jobs), "jobs": jobs}
     # Same inert-job class as create; an empty list has nothing inert.
     if jobs:
@@ -758,7 +790,8 @@ def _action_run(job: Dict[str, Any], a: Dict[str, Any]) -> str:
         return handed_off
     # A manual run must actually run even with no ticker active. Preferred: background
     # dispatch (handle now, outcome as a completion event); inline fallback otherwise.
-    bg = _try_dispatch_background_run(job, session_id=a["session_id"], extra_prompt=extra_prompt)
+    completion_scope = {"completion_home": a["_creator_home"]} if a.get("_creator_home") is not None else {}
+    bg = _try_dispatch_background_run(job, session_id=a["session_id"], extra_prompt=extra_prompt, **completion_scope)
     if bg is not None and bg.get("dispatched"):
         _notify_provider_jobs_changed_safe()
         result = _refreshed_job_view(job_id)
@@ -932,6 +965,8 @@ _UPDATE_STEPS = (_update_core_fields, _update_script_fields, _update_context_fro
 
 def _action_update(job: Dict[str, Any], a: Dict[str, Any]) -> str:
     updates: Dict[str, Any] = {}
+    if a.get("public_task_context") is not None:
+        updates["public_task_context"] = a["public_task_context"]
     for step in _UPDATE_STEPS:
         error = step(job, a, updates)
         if error:
@@ -947,7 +982,8 @@ def _action_update(job: Dict[str, Any], a: Dict[str, Any]) -> str:
 
 _JOBLESS_ACTIONS = {"create": _action_create, "list": _action_list}
 _JOB_ACTIONS = {
-    "remove": _action_remove, "update": _action_update,
+    "remove": _action_remove, "delete": _action_remove, "update": _action_update,
+    "get": lambda job, a: _dumps({"success": True, "job": _format_job(job)}),
     "run": _action_run, "run_now": _action_run, "trigger": _action_run,
     "pause": lambda job, a: _job_state_result(pause_job(job["id"], reason=a["reason"])),
     "resume": lambda job, a: _job_state_result(resume_job(job["id"])),
@@ -959,6 +995,8 @@ def _resolve_job_or_error(job_id: str):
     try:
         job = resolve_job_ref(job_id)
     except AmbiguousJobReference as exc:
+        for match in exc.matches:
+            _authorize_job_public_context(get_job(match["id"]) or {})
         return None, _dumps({
             "success": False,
             "error": str(exc),
@@ -971,6 +1009,7 @@ def _resolve_job_or_error(job_id: str):
         return None, _dumps(
             {"success": False, "error": f"Job with ID or name '{job_id}' not found. Use cronjob(action='list') to inspect jobs."},
         )
+    _authorize_job_public_context(job)
     return job, None
 
 
@@ -1005,26 +1044,29 @@ def cronjob(
     paused: bool = False,
     paused_reason: Optional[str] = None,
     pinned: Optional[bool] = None,
-    interpreter: Optional[str] = None) -> str:
+    interpreter: Optional[str] = None,
+    execute_as: Optional[str] = None,
+    public_task_context: Optional[Dict[str, str]] = None) -> str:
     """Unified cron job management tool."""
     a = dict(locals())
     del a["task_id"]  # unused but kept for handler signature compatibility
     try:
-        normalized = (action or "").strip().lower()
-        handler = _JOBLESS_ACTIONS.get(normalized)
-        if handler is not None:
-            return handler(a)
-        if not job_id:
-            return tool_error(f"job_id is required for action '{normalized}'", success=False)
-        # Job resolution precedes the action check (an unknown action on a missing job
-        # reports the missing job) — preserved ordering.
-        job, error = _resolve_job_or_error(job_id)
-        if error is not None:
-            return error
-        handler = _JOB_ACTIONS.get(normalized)
-        if handler is None:
-            return tool_error(f"Unknown cron action '{action}'", success=False)
-        return handler(job, a)
+        with _cron_execution_scope(a):
+            normalized = (action or "").strip().lower()
+            handler = _JOBLESS_ACTIONS.get(normalized)
+            if handler is not None:
+                return handler(a)
+            if not job_id:
+                return tool_error(f"job_id is required for action '{normalized}'", success=False)
+            # Job resolution precedes the action check (an unknown action on a missing job
+            # reports the missing job) — preserved ordering.
+            job, error = _resolve_job_or_error(job_id)
+            if error is not None:
+                return error
+            handler = _JOB_ACTIONS.get(normalized)
+            if handler is None:
+                return tool_error(f"Unknown cron action '{action}'", success=False)
+            return handler(job, a)
     except Exception as e:
         return tool_error(str(e), success=False)
 
@@ -1050,7 +1092,7 @@ CRONJOB_SCHEMA = {
 
 Jobs run on the main agent model (whatever `hermes model` is set to when they fire) unless pinned.
 
-Jobs run in a fresh session with no current-chat context, so prompts must be self-contained, and the agent's FINAL RESPONSE is what gets delivered — cron runs are autonomous and cannot ask questions. Jobs run on the main agent model (whatever `hermes model` is set to when they fire) unless the user pins one. Prefer updating an existing job over creating near-duplicates.""",
+Jobs run in a fresh session. Prompts must be self-contained unless public_task_context explicitly selects current public chat context. The agent's FINAL RESPONSE is what gets delivered — cron runs are autonomous and cannot ask questions. Jobs run on the main agent model (whatever `hermes model` is set to when they fire) unless the user pins one. Prefer updating an existing job over creating near-duplicates.""",
     "parameters": {
         "type": "object",
         "properties": {
@@ -1058,11 +1100,26 @@ Jobs run in a fresh session with no current-chat context, so prompts must be sel
             "paused_reason": {"type": "string", "description": "Create only: auditable reason; requires paused=true."},
             "action": {
                 "type": "string",
-                "description": "One of: create, list, update, pause, resume, remove, run. When action=create, the 'schedule' and 'prompt' fields are REQUIRED."
+                "description": "One of: create, list, get, update, pause, resume, remove (or delete), run. When action=create, the 'schedule' and 'prompt' fields are REQUIRED."
             },
             "job_id": {
                 "type": "string",
-                "description": "Required for update/pause/resume/remove/run."
+                "description": "Required for get/update/pause/resume/remove/delete/run."
+            },
+            "execute_as": {
+                "type": "string",
+                "description": "Optional canonical existing profile. Applies to every action and selects only that profile's cron store. Cross-profile execution requires the current profile's operator-configured cron.allowed_executors grant and the executor's own served adapter. Omit for the current profile."
+            },
+            "public_task_context": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "platform": {"type": "string"},
+                    "chat_id": {"type": "string"},
+                    "thread_id": {"type": "string"}
+                },
+                "required": ["platform", "chat_id"],
+                "description": "Create/update only: explicitly select bounded public task messages, fetched with the executor's own chat access at creation and each fire. The adapter must support public task context. No private session history is copied."
             },
             "pinned": {
                 "type": "boolean",
@@ -1087,7 +1144,7 @@ Jobs run in a fresh session with no current-chat context, so prompts must be sel
             },
             "deliver": {
                 "type": "string",
-                "description": "Where the job's output is POSTED as a one-way message (the job itself always runs in a fresh session with no chat context). Omit to address the chat/topic this job was created from. Otherwise: 'local' (save only, no delivery), 'all' (every connected home channel, resolved at fire time), 'bot-chat' or 'bot-chat:<profile>' (inject into a Bot Chat as a real message), or platform:chat_id:thread_id (e.g. 'telegram:-1001234567890:17585'). Comma-combine like 'origin,all'."
+                "description": "Where the job's FINAL RESPONSE is posted. Omit to address the chat/topic this job was created from. Otherwise: 'local' (save only, no delivery), 'all' (every connected home channel, resolved at fire time), 'bot-chat' or 'bot-chat:<profile>' (inject into a Bot Chat as a real message), or platform:chat_id:thread_id (e.g. 'telegram:-1001234567890:17585'). Comma-combine like 'origin,all'. Jobs use fresh sessions; public_task_context explicitly adds public chat messages."
             },
             "failure_deliver": {
                 "type": "string",
@@ -1161,7 +1218,7 @@ def check_cronjob_requirements() -> bool:
 _HANDLER_FORWARDED_ARGS = (
     "job_id", "prompt", "schedule", "name", "repeat", "deliver", "failure_deliver", "skill", "skills", "reason",
     "script", "context_from", "continuity", "enabled_toolsets", "workdir", "no_agent", "attach_to_session",
-    "paused_reason", "pinned")
+    "paused_reason", "pinned", "execute_as", "public_task_context")
 
 
 def _cronjob_handler(args, **kw):

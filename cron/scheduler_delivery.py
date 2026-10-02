@@ -206,44 +206,76 @@ def _cron_mirror_message(job: dict, text: str) -> str:
 
 def _maybe_mirror_cron_delivery(
     job: dict, platform_name: str, chat_id: str, mirror_text: str, thread_id: Optional[str] = None,
-    user_id: Optional[str] = None, *, enabled: bool = False,
-) -> None:
-    """Best-effort mirror of a cron delivery into the origin chat's session. No-op unless
-    ``enabled`` (caller resolves it, scoped to the origin target). Rides the same
-    ``mirror_to_session`` path as ``send_message``, passing ``user_id`` so user-isolated group
-    chats resolve to the scheduling member. All failures swallowed — a successful delivery must
-    never be reported failed because the mirror broke."""
-    if not enabled:
-        return
-    text = (mirror_text or "").strip()
-    if not text:
-        return
+    user_id: Optional[str] = None, *, enabled: bool = False, adapter=None, loop=None,
+    origin: Optional[dict] = None,
+) -> Optional[str]:
+    """Return an attachment warning without turning a confirmed send into a retry.
+
+    Continuation belongs to the current reply route, not the newest row with a matching sender.
+    An unavailable runtime or canonical route fails closed and surfaces in existing run diagnostics.
+    """
+    if not enabled or not (mirror_text or "").strip():
+        return None
+    if getattr(adapter, "public_context_admission_enabled", False) is True:
+        # The confirmed public message is admitted at the next ordinary turn,
+        # even if a worker is currently busy. One writer owns the transcript.
+        return None
     try:
         from gateway.mirror import mirror_to_session
-        # USER role + labelled prefix, NOT assistant: an assistant-role mirror lands
-        # assistant→assistant and breaks strict alternation; consecutive user turns merge safely.
-        # The brief is not the agent speaking; an assistant-role mirror lands as assistant→assistant after
-        # the agent's last turn and breaks strict alternation (issue #2221, the exact failure #2313
-        # removed). A user-role turn collapses safely via repair_message_sequence's consecutive-user merge
-        # on every provider, and the prefix preserves the "this came from cron" context that the dropped
-        # SQLite mirror metadata would otherwise lose on replay.
+        from gateway.session_identity import identity_of
+        from hermes_cli.config import get_hermes_home
+        from agent.async_utils import safe_schedule_threadsafe
+
+        from gateway.platform_registry import platform_registry
+        entry = platform_registry.get(platform_name)
+        resolve = getattr(entry, "delivery_source_resolver", None)
+        if resolve is None:
+            # Native platforms retain their existing source construction. This opt-in
+            # seam avoids guessing their forum/channel/guild routing from chat metadata.
+            ok = mirror_to_session(
+                platform_name, str(chat_id), _cron_mirror_message(job, mirror_text.strip()),
+                source_label="cron", thread_id=thread_id if thread_id is not None else "",
+                user_id=user_id, role="user",
+            )
+            if not ok and job.get("attach_to_session") is True:
+                raise RuntimeError("no matching native gateway session")
+            return None
+        store = getattr(adapter, "_session_store", None)
+        if store is None or not callable(resolve) or loop is None or not loop.is_running():
+            raise RuntimeError("owning gateway runtime is unavailable")
+        source = safe_schedule_threadsafe(resolve(
+            adapter, str(chat_id), thread_id=thread_id, user_id=user_id,
+            chat_name=(origin or {}).get("chat_name"), scope_id=(origin or {}).get("scope_id"),
+        ), loop).result(timeout=20)
+        if source is None or getattr(source, "profile_route_rejected", False):
+            raise RuntimeError("canonical reply source is unavailable")
+        runner = getattr(adapter, "gateway_runner", None)
+        if runner is not None:
+            identity = runner._canonicalize(source, transport_profile=getattr(adapter, "_owner_profile", None))
+            if identity is None:
+                raise RuntimeError("canonical profile identity is unavailable")
+        identity = identity_of(source)
+        if identity is not None and identity.runtime_home.resolve() != get_hermes_home().resolve():
+            raise RuntimeError("reply route belongs to another profile")
+        if (source.chat_type != "dm" and store.config.group_sessions_per_user
+                and not (source.thread_id and not store.config.thread_sessions_per_user)
+                and not source.user_id):
+            raise RuntimeError("participant is required for an isolated reply route")
+        # A labelled USER turn preserves strict provider alternation. Use the store's owner DB;
+        # even an exact session id plus an ambient DB would cross profile boundaries.
         ok = mirror_to_session(
-            platform_name, str(chat_id), _cron_mirror_message(job, text),
-            source_label="cron", thread_id=thread_id, user_id=user_id, role="user")
-        if ok:
-            logger.info(
-                "Job '%s': mirrored delivery into %s:%s session transcript",
-                job.get("id", "?"), platform_name, chat_id)
-        else:
-            logger.debug(
-                "Job '%s': delivery mirror skipped for %s:%s "
-                "(no matching gateway session — cold start)",
-                job.get("id", "?"), platform_name, chat_id)
-    except Exception as e:
-        logger.debug(
-            "Job '%s': delivery mirror failed for %s:%s: %s", job.get("id", "?"), platform_name,
-            chat_id, e,
+            platform_name, str(chat_id), _cron_mirror_message(job, mirror_text.strip()),
+            source_label="cron", thread_id=thread_id, user_id=user_id, role="user",
+            session_store=store, source=source,
         )
+        if not ok:
+            raise RuntimeError("canonical session is missing, busy, suspended or changed during attachment")
+        logger.info("Job '%s': attached delivery to %s:%s reply session", job.get("id", "?"), platform_name, chat_id)
+        return None
+    except Exception as exc:
+        warning = f"delivery attachment failed for {platform_name}:{chat_id}: {exc} (message already sent)"
+        logger.warning("Job '%s': %s", job.get("id", "?"), warning)
+        return warning
 
 
 # chat_type slot a platform's adapter puts on a NON-DM in-thread reply. Discord (and the default)
@@ -1572,9 +1604,11 @@ def _live_send_media(
         delivery_errors.append(f"{_me} (target {t.where})")
 
 
-def _seed_live_delivery_sessions(t: _TargetDelivery, delivered_message_id) -> None:
+def _seed_live_delivery_sessions(t: _TargetDelivery, delivered_message_id, delivery_errors: list) -> None:
     """After a confirmed live send, seed continuation session(s) and run the generic mirror.
     Thread seeding is deferred here so open-succeeds/deliver-fails never seeds an unseen brief."""
+    if getattr(t.runtime_adapter, "public_context_admission_enabled", False) is True:
+        return
     job = t.job
     origin = t.origin
     seed_kwargs = dict(
@@ -1615,10 +1649,12 @@ def _seed_live_delivery_sessions(t: _TargetDelivery, delivered_message_id) -> No
             "skipped; the plain mirror below may still apply",
             job["id"], t.platform_name, t.chat_id,
             origin.get("platform"), origin.get("chat_id"), origin.get("thread_id"))
-    _maybe_mirror_cron_delivery(
+    warning = _maybe_mirror_cron_delivery(
         job, t.platform_name, t.chat_id, t.mirror_text, thread_id=t.thread_id,
-        user_id=t.origin_user_id,
+        user_id=t.origin_user_id, adapter=t.runtime_adapter, loop=t.loop, origin=t.origin,
         enabled=t.mirror_this_target and not thread_seeded and not inchannel_seeded)
+    if warning:
+        delivery_errors.append(warning)
 
 
 def _deliver_via_live_adapter(
@@ -1677,7 +1713,7 @@ def _deliver_via_live_adapter(
                 route_thread_id if route_thread_id is not None else "-",
                 delivered_message_id if delivered_message_id is not None else "-")
             delivered = True
-            _seed_live_delivery_sessions(t, delivered_message_id)
+            _seed_live_delivery_sessions(t, delivered_message_id, delivery_errors)
     except Exception as e:
         err_msg = f"live adapter delivery to {t.where} failed: {e}"
         if not any(err_msg in err for err in target_errors):
@@ -1758,7 +1794,7 @@ def _queue_for_live_reconnect(t: _TargetDelivery, content: str, media_files: lis
     standalone lane then failed to send to the delivery ledger, as a failed reconnect-only row
     owned by the adapter that rejected it: the post-reconnect sweep redelivers it (#125363). Only
     reached after standalone failed, so nothing was sent and a replay cannot duplicate. The ledger
-    carries text only; dropped attachments are reported."""
+    carries text only; dropped attachments and unavailable session attachment are reported."""
     try:
         from gateway.delivery_ledger import (
             compute_obligation_id, is_reconnect_only, ledger_enabled, mark_failed, record_obligation)
@@ -1778,6 +1814,8 @@ def _queue_for_live_reconnect(t: _TargetDelivery, content: str, media_files: lis
     note = f"queued text for {t.where} for redelivery once the live adapter reconnects"
     if media_files:
         note += f" ({len(media_files)} attachment(s) not queued)"
+    if t.mirror_this_target:
+        note += " (session attachment is unavailable for queued reconnect delivery)"
     logger.warning("Job '%s': %s", t.job.get("id"), note)
     delivery_errors.append(note)
 
@@ -1813,10 +1851,12 @@ def _deliver_standalone(
         delivery_errors.append(msg)
     logger.info("Job '%s': delivered to %s:%s", job["id"], t.platform_name, t.chat_id)
     # Thread seeding only happens on the live lane, so no thread_seeded gate applies here.
-    _maybe_mirror_cron_delivery(
+    warning = _maybe_mirror_cron_delivery(
         job, t.platform_name, t.chat_id, t.mirror_text, thread_id=t.thread_id,
-        user_id=t.origin_user_id,
+        user_id=t.origin_user_id, adapter=t.runtime_adapter, loop=t.loop, origin=t.origin,
         enabled=t.mirror_this_target)
+    if warning:
+        delivery_errors.append(warning)
 
 
 def _prepare_target_delivery(
@@ -1895,10 +1935,54 @@ def _prepare_target_delivery(
             job.get("id", "?"), platform_name)
         in_channel_surface = False
     if in_channel_surface and inchannel_continuable and live_adapter_ready:
-        # Force flat (D2): an inherited thread_id would never match the flat seed (None). Gated
-        # on `inchannel_continuable` (SAME gate as the seed) AND `live_adapter_ready` (fallback
-        # never seeds). Stay AFTER mirror_this_target/origin_user_id (need ORIGINAL thread_id).
-        thread_id = None
+        from gateway.platform_registry import platform_registry
+
+        resolve = getattr(platform_registry.get(platform_name), "delivery_source_resolver", None)
+        if callable(resolve):
+            # Some adapters represent a child as an independent physical chat. Their
+            # canonical reply tuple must survive in-channel delivery too.
+            try:
+                from agent.async_utils import safe_schedule_threadsafe
+                from gateway.session_identity import identity_of
+                from hermes_cli.profiles import current_profile_name
+                from hermes_constants import get_hermes_home
+                from pathlib import Path
+
+                future = safe_schedule_threadsafe(resolve(
+                    runtime_adapter, str(chat_id), thread_id=thread_id, user_id=origin_user_id,
+                    chat_name=origin.get("chat_name"), scope_id=origin.get("scope_id"),
+                ), loop)
+                if future is None:
+                    raise RuntimeError("owning gateway loop is unavailable")
+                source = future.result(timeout=20)
+                if source is None or getattr(source, "profile_route_rejected", False):
+                    raise RuntimeError("canonical reply source is unavailable")
+                runner = getattr(runtime_adapter, "gateway_runner", None)
+                if runner is not None and runner._canonicalize(
+                        source, transport_profile=getattr(runtime_adapter, "_owner_profile", None)) is None:
+                    raise RuntimeError("canonical profile identity is unavailable")
+                identity = identity_of(source)
+                home = get_hermes_home().resolve()
+                if identity is not None:
+                    if identity.runtime_home.resolve() != home or identity.authorization_home.resolve() != home:
+                        raise RuntimeError("reply route belongs to another profile")
+                else:
+                    executor = current_profile_name(default="default")
+                    if (source.profile or "default") != executor:
+                        raise RuntimeError("reply route belongs to another profile")
+                    owner = getattr(runtime_adapter, "_owner_profile", None)
+                    if owner is not None and owner != executor:
+                        raise RuntimeError("receiving adapter belongs to another profile")
+                    adapter_home = getattr(runtime_adapter, "_profile_home", None)
+                    if adapter_home is not None and Path(adapter_home).resolve() != home:
+                        raise RuntimeError("receiving adapter belongs to another home")
+                chat_id, thread_id = str(source.chat_id), source.thread_id
+            except Exception as exc:
+                _note_target_error(job, f"canonical in-channel reply route unavailable: {exc}", delivery_errors)
+                return None
+        else:
+            # Native flat-channel continuation retains its matching flat seed.
+            thread_id = None
 
     # Thread-preferred continuable cron: open a DEDICATED thread; its session is seeded after a
     # successful send. DM-only platforms return None → mirror the origin DM. in_channel SKIPS

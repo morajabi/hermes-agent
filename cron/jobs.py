@@ -1797,6 +1797,26 @@ def _next_run_or_reject_past_oneshot(
     return next_run_at
 
 
+def normalize_public_task_context(value: Any) -> Optional[Dict[str, str]]:
+    """Keep only an explicit public platform/chat/thread selector, never profile paths or users."""
+    if value is None:
+        return None
+    if not isinstance(value, dict) or set(value) - {"platform", "chat_id", "thread_id"}:
+        raise ValueError("public_task_context must contain only platform, chat_id and optional thread_id.")
+    result = {}
+    for key in ("platform", "chat_id", "thread_id"):
+        item = value.get(key)
+        if key == "thread_id" and item is None:
+            continue
+        if (not isinstance(item, str) or not item or item != item.strip() or len(item) > 256
+                or any(ord(char) < 32 for char in item)):
+            raise ValueError(f"public_task_context.{key} must be a nonempty string (at most 256 characters).")
+        result[key] = item
+    if not re.fullmatch(r"[a-z][a-z0-9_-]*", result["platform"]):
+        raise ValueError("public_task_context.platform must be a canonical platform name.")
+    return result
+
+
 def create_job(
     prompt: Optional[str],
     schedule: str,
@@ -1823,6 +1843,7 @@ def create_job(
     paused_reason: Optional[str] = None,
     pinned: bool = False,
     interpreter: Optional[str] = None,
+    public_task_context: Optional[Dict[str, str]] = None,
 ) -> Dict[str, Any]:
     """Create a new cron job and return the stored record.
 
@@ -1840,6 +1861,9 @@ def create_job(
         raise ValueError("paused_reason must be a string.")
     if paused_reason is not None and not paused:
         raise ValueError("paused_reason requires paused=True.")
+    public_task_context = normalize_public_task_context(public_task_context)
+    if public_task_context is not None and no_agent:
+        raise ValueError("public_task_context requires an agent job.")
     parsed_schedule = parse_schedule(schedule)
     # Normalize repeat: treat 0 or negative values as None (infinite). String forms
     # ('forever'/'once'/numeric) coerce via normalize_repeat_value — the shared chokepoint with update paths
@@ -1919,6 +1943,7 @@ def create_job(
     for key, value in (
         ("attach_to_session", normalized_attach), ("reasoning_effort", normalized_reasoning_effort),
         ("failure_deliver", f["failure_deliver"]), ("interpreter", f["interpreter"]),
+        ("public_task_context", public_task_context),
     ):
         if value is not None:
             job[key] = value
@@ -2099,12 +2124,16 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
     bad_fields = _IMMUTABLE_JOB_FIELDS.intersection(updates or {})
     if bad_fields:
         raise ValueError(f"Cron job field(s) cannot be updated: {', '.join(sorted(bad_fields))}")
+    if "public_task_context" in updates:
+        updates = {**updates, "public_task_context": normalize_public_task_context(updates["public_task_context"])}
 
     def apply(jobs, i, job):
         _rederive_repeat_for_schedule_change(job, updates)
         _normalize_job_updates(job, updates)
         _apply_pin_update(job, updates)
         updated = _apply_skill_fields({**job, **updates})
+        if updated.get("public_task_context") is not None and updated.get("no_agent"):
+            raise ValueError("public_task_context requires an agent job.")
         _reject_terminal_activation(job, updated, job_id)
         # Re-check on the MERGED record; scoped to changed fields so legacy records keep loading.
         if {"monitor_script", "monitor_url", "no_agent", "script"}.intersection(updates):

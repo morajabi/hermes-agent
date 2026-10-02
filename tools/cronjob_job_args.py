@@ -3,6 +3,7 @@ tools/cronjob_tools.py)."""
 
 import contextlib
 import logging
+import sys
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Union
 
@@ -105,6 +106,105 @@ def _origin_from_env(
         # so a continuable cron seed built without it would never resolve a scoped reply.
         "scope_id": get_session_env("HERMES_SESSION_SCOPE_ID") or None,
     }
+
+
+@contextlib.contextmanager
+def _cron_execution_scope(args: Dict[str, Any]):
+    """Authorize an explicit existing executor, then use its normal runtime and cron store."""
+    execute_as = args.get("execute_as")
+    selector = args.get("public_task_context")
+    if execute_as is None and selector is None:
+        yield
+        return
+    from cron.jobs import normalize_public_task_context, use_cron_store
+    from hermes_cli.config import load_config_readonly
+    from hermes_cli.profiles import current_profile_name, get_profile_dir
+    from hermes_constants import PROFILE_ID_RE, get_hermes_home
+
+    creator = current_profile_name()
+    executor = creator if execute_as is None else execute_as
+    if not isinstance(executor, str) or not PROFILE_ID_RE.fullmatch(executor):
+        raise ValueError("execute_as must be a canonical existing profile name, never a path.")
+    origin = _origin_from_env(args.get("schedule"))
+    cross_profile = executor != creator
+    if cross_profile:
+        allowed = (load_config_readonly().get("cron") or {}).get("allowed_executors", [])
+        if not isinstance(allowed, list) or executor not in allowed:
+            raise ValueError("execute_as is not authorized by this profile's cron.allowed_executors.")
+        from gateway.session_context import get_current_turn_source, get_session_env
+        from gateway.session import SessionSource
+        from gateway.session_identity import identity_of
+
+        source = get_current_turn_source()
+        identity = identity_of(source) if isinstance(source, SessionSource) else None
+        author_profile = identity.runtime_profile if identity is not None else getattr(source, "profile", None) or "default"
+        if (not isinstance(source, SessionSource) or source.is_bot is not False
+                or not origin or str(source.user_id or "") != origin.get("user_id")
+                or source.platform.value != origin.get("platform")
+                or str(source.chat_id) != origin.get("chat_id")
+                or source.thread_id != (get_session_env("HERMES_SESSION_THREAD_ID") or None)
+                or author_profile != creator
+                or (identity is not None and identity.runtime_home.resolve() != get_hermes_home().resolve())):
+            raise ValueError("Cross-profile cron actions require this turn's authenticated human author.")
+        args["_creator_home"] = get_hermes_home().resolve()
+    target_home = get_profile_dir(executor) if cross_profile else get_hermes_home()
+    if not target_home.is_dir():
+        raise ValueError("execute_as must name an existing profile.")
+    runner_ref = getattr(sys.modules.get("gateway.run"), "_gateway_runner_ref", None)
+    runner = runner_ref() if callable(runner_ref) else None
+    if runner is None:
+        raise ValueError("Explicit cron executors and public context require a running gateway.")
+    adapters = runner._adapters_for_profile(executor)
+    shared = getattr(runner, "_is_shared_bot_satellite", None)
+    if not adapters or (callable(shared) and shared(executor)):
+        raise ValueError("The executor must be served by its own connected platform adapter.")
+
+    action = (args.get("action") or "").strip().lower()
+    if selector is not None and action not in {"create", "update"}:
+        raise ValueError("public_task_context is only accepted for create or update.")
+    selector = normalize_public_task_context(selector)
+    if action == "create" and origin:
+        args["_captured_origin"] = {
+            **origin, "profile": executor, "creator_profile": creator, "executor_profile": executor,
+        }
+    args["public_task_context"] = selector
+    from gateway.run import _profile_runtime_scope
+    from cron.scheduler_prompt import _fetch_public_task_context
+
+    with _profile_runtime_scope(target_home), use_cron_store(target_home):
+        # The target's actual adapter must be able to read the creator's current chat before a
+        # cross-profile job can be registered. The selected public task is checked separately.
+        current_chat = None
+        if action == "create" and cross_profile:
+            current_chat = {key: origin[key] for key in ("platform", "chat_id", "thread_id") if origin.get(key)}
+            _fetch_public_task_context(
+                {"public_task_context": current_chat, "origin": origin},
+                adapters=adapters, loop=runner._gateway_loop,
+            )
+        if selector is not None and selector != current_chat:
+            _fetch_public_task_context(
+                {"public_task_context": selector, "origin": origin},
+                adapters=adapters, loop=runner._gateway_loop,
+            )
+        yield
+
+
+def _authorize_job_public_context(job: Dict[str, Any]) -> None:
+    """Recheck the stored task through its worker before revealing or managing this job."""
+    if job.get("public_task_context") is None:
+        return
+    from cron.scheduler_prompt import _fetch_public_task_context
+    from hermes_cli.profiles import current_profile_name
+
+    runner_ref = getattr(sys.modules.get("gateway.run"), "_gateway_runner_ref", None)
+    runner = runner_ref() if callable(runner_ref) else None
+    if runner is None:
+        raise ValueError("Public-context jobs require their owning gateway for management.")
+    executor = current_profile_name(default="default")
+    shared = getattr(runner, "_is_shared_bot_satellite", None)
+    if callable(shared) and shared(executor):
+        raise ValueError("The executor must use its own connected platform adapter.")
+    _fetch_public_task_context(job, adapters=runner._adapters_for_profile(executor), loop=runner._gateway_loop)
 
 
 def _local_delivery_notice(job: Dict[str, Any], user_deliver: Optional[str]) -> Optional[str]:
@@ -419,7 +519,7 @@ def _validate_context_from_refs(refs: List[Any]) -> Optional[str]:
 # Optional fields echoed by _format_job only when truthy (order = JSON key order).
 _FORMAT_JOB_OPTIONAL_KEYS = (
     "script", "reasoning_effort", "monitor_script", "monitor_url",
-    "monitor_state", "no_agent", "enabled_toolsets", "workdir", "interpreter")
+    "monitor_state", "no_agent", "enabled_toolsets", "workdir", "interpreter", "public_task_context")
 
 
 def _format_job(job: Dict[str, Any]) -> Dict[str, Any]:
@@ -472,6 +572,10 @@ def _format_job(job: Dict[str, Any]) -> Dict[str, Any]:
         result["context_from"] = external_refs
     if isinstance(job.get("attach_to_session"), bool):
         result["attach_to_session"] = job["attach_to_session"]
+    origin = job.get("origin")
+    if isinstance(origin, dict) and origin.get("executor_profile"):
+        result["execute_as"] = origin["executor_profile"]
+        result["creator_profile"] = origin.get("creator_profile")
     return result
 
 

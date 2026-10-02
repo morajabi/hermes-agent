@@ -36,7 +36,7 @@ def gateway_loop():
     loop.call_soon_threadsafe(loop.stop)
 
 
-def _deliver_through_router(monkeypatch, loop, *, live_error: str):
+def _deliver_through_router(monkeypatch, loop, *, live_error: str, mirror_this_target: bool = False):
     """Run the live lane against a transport whose send is rejected with ``live_error`` (the router
     raises it), then the standalone lane on a token-less worker. Returns (standalone calls, errors)."""
     class Transport:
@@ -49,7 +49,7 @@ def _deliver_through_router(monkeypatch, loop, *, live_error: str):
     fields = {name: None for name in sd._TargetDelivery.__dataclass_fields__}
     fields.update(job={"id": "job-1"}, platform=Platform.TELEGRAM, platform_name="telegram", chat_id="-100",
                   thread_id="42", transport=Transport(), config=GatewayConfig(), loop=loop,
-                  target_adapters={}, mirror_text="", origin={})
+                  target_adapters={}, mirror_text="", origin={}, mirror_this_target=mirror_this_target)
     t = sd._TargetDelivery(**fields)
     standalone_calls = []
     monkeypatch.setattr(
@@ -66,6 +66,18 @@ def test_reconnect_only_rejection_survives_a_failed_standalone_for_the_sweep(mon
     standalone_calls, errors = _deliver_through_router(monkeypatch, gateway_loop, live_error="send_path_degraded")
     assert standalone_calls == ["the report"]  # standalone still gets its chance first
     assert any("queued text for telegram:-100:42" in e for e in errors)
+    claimed = dl.sweep_failed_for_runtime("telegram", profile="satellite")
+    assert [(row["chat_id"], row["thread_id"], row["content"]) for row in claimed] == [("-100", "42", "the report")]
+    assert not any("session attachment" in e for e in errors)
+
+
+def test_reconnect_queue_reports_unavailable_requested_session_attachment(monkeypatch, gateway_loop):
+    standalone_calls, errors = _deliver_through_router(
+        monkeypatch, gateway_loop, live_error="send_path_degraded", mirror_this_target=True)
+    assert standalone_calls == ["the report"]
+    queued = [e for e in errors if "queued text" in e]
+    assert len(queued) == 1
+    assert "session attachment is unavailable for queued reconnect delivery" in queued[0]
     claimed = dl.sweep_failed_for_runtime("telegram", profile="satellite")
     assert [(row["chat_id"], row["thread_id"], row["content"]) for row in claimed] == [("-100", "42", "the report")]
 

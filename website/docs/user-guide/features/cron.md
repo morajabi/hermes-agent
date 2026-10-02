@@ -74,6 +74,53 @@ Every morning at 9am, check Hacker News for AI news and send me a summary on Tel
 
 Hermes will use the unified `cronjob_manage` tool internally.
 
+### Assigning an existing profile a public task
+
+An operator can allow the current profile to create and manage another served profile's jobs.
+For example, put this in Chief's `config.yaml`:
+
+```yaml
+cron:
+  allowed_executors: [scout]
+```
+
+Chief can then call the existing tool with an explicit executor and public task selector:
+
+```json
+{
+  "action": "create",
+  "execute_as": "scout",
+  "schedule": "every 1h",
+  "prompt": "Review this task's current public messages and report useful progress.",
+  "public_task_context": {"platform": "inline", "chat_id": "9213", "thread_id": "9300"},
+  "deliver": "inline:9213:9300",
+  "attach_to_session": true
+}
+```
+
+The job belongs to Scout's cron store and scheduler, and runs with Scout's configuration,
+tools, and credentials. Its delivery origin names Scout; Chief and the creating human are
+recorded as provenance. Use `execute_as: "scout"` again when listing, getting, updating,
+pausing, resuming, running, or removing that job. Listing stays within the selected store.
+Omitting `execute_as` keeps the current profile's existing behavior.
+`public_task_context` selects the public messages read by the job; `deliver` selects where
+its output is posted. The explicit delivery tuple above keeps Scout's reports in the selected
+task. Omitting `deliver` posts to the requesting chat or topic captured at creation instead.
+Cross-profile creation and management require an authenticated human-authored current turn.
+An unsolicited bot message, an unverified sender, or a user ID in tool arguments cannot
+exercise this grant. When Chief manually runs Scout's job in the background, Scout executes
+and saves the job's output, while Chief's session store retains its completion for recovery.
+
+This requires a running gateway serving Scout's own connected adapter and a platform that
+implements public task context. Scout must be able to read the current creation chat and the
+selected public task. Access is checked again at every fire; unavailable context stops the
+run before inference. Every management action also rechecks the job's stored task selector,
+including pause and deletion. Listing fails closed if a selected job is inaccessible. Only
+bounded public messages are fetched. Chief's private provider
+transcript, memory, profile files, and tokens are never copied. Managed workers receive the
+fresh public projection captured immediately before their existing worker handoff; the
+projection is transient and is not saved in the job definition.
+
 ## Pre-dispatch configuration validation
 
 Before constructing any agent machinery for a scheduled run, the scheduler

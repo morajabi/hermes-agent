@@ -2170,10 +2170,14 @@ _RunResult = tuple[bool, str, str, Optional[str]]
 
 def _prepare_job_prompt(
     job: dict, job_id: str, job_name: str, extra_prompt: Optional[str], cancel_event,
+    runtime_data_prompt: Optional[str] = None,
 ) -> tuple[Optional[_RunResult], Optional[str]]:
     """Run every pre-agent gate and build the prompt. Returns ``(early_result, prompt)``: an early
     result short-circuits ``run_job`` (no_agent job, empty payload, monitor gate, wake gate,
     injection block, empty prompt); otherwise ``prompt`` is set."""
+    if job.get("public_task_context") is not None and not runtime_data_prompt:
+        error = "Public task context was not fetched using the executor's current chat access."
+        return (False, f"# Cron Job: {job_name}\n\nError: {error}\n", "", error), None
     # Fail closed on a corrupt config.yaml: defaults would let auto-detection bill a provider the
     # user never chose. no_agent jobs are exempt. Escape hatch: HERMES_IGNORE_USER_CONFIG=1.
     if not job.get("no_agent"):
@@ -2230,7 +2234,7 @@ def _prepare_job_prompt(
     try:
         prompt = _build_job_prompt(
             job, prerun_script=prerun_script, extra_prompt=extra_prompt,
-            runtime_data_prompt=monitor_context,
+            runtime_data_prompt="\n\n".join(filter(None, (monitor_context, runtime_data_prompt))) or None,
         )
     except CronPromptInjectionBlocked as block_exc:
         # Injection scanner tripped: refuse this tick and tell the operator WHY.
@@ -2473,6 +2477,7 @@ class _FireAudit:
 def run_job(
     job: dict, *, defer_agent_teardown: Optional[list] = None, extra_prompt: Optional[str] = None,
     cancel_event: Optional[_CancelEventLike] = None, execution_id: Optional[str] = None,
+    runtime_data_prompt: Optional[str] = None,
 ) -> tuple[bool, str, str, Optional[str]]:
     """Execute a single cron job. Returns (success, full_output_doc, final_response, error).
     ``defer_agent_teardown``: if a list, the live agent is appended instead of torn down; the caller
@@ -2492,7 +2497,8 @@ def run_job(
     job_id = job["id"]
     job_name = str(job.get("name") or job.get("prompt") or job_id or "cron job")
 
-    early, prompt = _prepare_job_prompt(job, job_id, job_name, extra_prompt, cancel_event)
+    early, prompt = _prepare_job_prompt(
+        job, job_id, job_name, extra_prompt, cancel_event, runtime_data_prompt=runtime_data_prompt)
     if early is not None:
         return early
     from run_agent import AIAgent
@@ -2709,6 +2715,7 @@ def _run_with_fire_claim_heartbeat(job: dict, run) -> bool:
 def run_one_job(
     job: dict, *, adapters=None, loop=None, verbose: bool = False,
     extra_prompt: Optional[str] = None, cancel_event: Optional[_CancelEventLike] = None,
+    runtime_data_prompt: Optional[str] = None,
 ) -> bool:
     """Run ONE due job end-to-end: execute → save output → deliver → mark. Shared by the built-in
     ticker and external providers' ``fire_due``; does NOT decide due-ness or acquire the initial
@@ -2726,9 +2733,16 @@ def run_one_job(
     execution_id = str(job["execution_id"])
     note_cron_execution(job)
     external_owner = os.environ.get("_HERMES_CRON_EXTERNAL_WORKER") == execution_id
-    if not external_owner:
+    if not external_owner or job.get("public_task_context") is not None:
         try:
-            if _launch_external_cron_worker(job):
+            if job.get("public_task_context") is not None:
+                if external_owner:
+                    if not isinstance(runtime_data_prompt, str) or not runtime_data_prompt.strip():
+                        raise RuntimeError("Public task context is missing from the authenticated worker handoff.")
+                else:
+                    runtime_data_prompt = _fetch_public_task_context(job, adapters=adapters, loop=loop)
+            launch_kwargs = {"runtime_data_prompt": runtime_data_prompt} if runtime_data_prompt else {}
+            if not external_owner and _launch_external_cron_worker(job, **launch_kwargs):
                 return True
         except Exception as handoff_error:
             # Past the handoff the worker may have adopted the row, run side effects
@@ -2785,6 +2799,7 @@ def run_one_job(
                     loop=loop,
                     verbose=verbose,
                     extra_prompt=extra_prompt,
+                    runtime_data_prompt=runtime_data_prompt,
                     claim_lost=lost_ownership,
                     transport_cancel=cancel_event,
                     execution_token=execution_token))
@@ -3196,6 +3211,7 @@ def _run_one_job_body(
     extra_prompt: Optional[str] = None, claim_lost: Optional[_CancelEventLike] = None,
     transport_cancel: Optional[_CancelEventLike] = None,
     execution_token: Optional[object] = None,
+    runtime_data_prompt: Optional[str] = None,
 ) -> bool:
     fence = _FireOwnership(job, claim_lost, transport_cancel)
     fire_owner = fence.owner
@@ -3281,6 +3297,8 @@ def _run_one_job_body(
             "execution_id": execution_id}
         if fence.cancel_event is not None:
             _run_kwargs["cancel_event"] = fence.cancel_event
+        if runtime_data_prompt is not None:
+            _run_kwargs["runtime_data_prompt"] = runtime_data_prompt
         try:
             success, output, final_response, error = run_job(job, **_run_kwargs)
         except BaseException:
@@ -3494,7 +3512,7 @@ def _wait_for_external_cron_worker(
                 pass
 
 
-def _launch_external_cron_worker(job: dict) -> bool:
+def _launch_external_cron_worker(job: dict, *, runtime_data_prompt: Optional[str] = None) -> bool:
     """Launch *job* outside the managed gateway process when required.
 
     Returns ``False`` outside a managed systemd gateway (in-process path).  In
@@ -3572,6 +3590,7 @@ def _launch_external_cron_worker(job: dict) -> bool:
                     "job": job,
                     "profile_home": str(_get_hermes_home().resolve()),
                     "multiplex_active": multiplex_active,
+                    **({"runtime_data_prompt": runtime_data_prompt} if runtime_data_prompt is not None else {}),
                 },
                 payload_file,
             )
@@ -3817,7 +3836,10 @@ def _run_external_worker_payload(payload_path: Path, ack_path: Path) -> bool:
             old_external_execution = os.environ.get("_HERMES_CRON_EXTERNAL_WORKER")
             os.environ["_HERMES_CRON_EXTERNAL_WORKER"] = execution_id
             try:
-                return run_one_job(job, adapters=None, loop=None, verbose=False)
+                context_kwargs = (
+                    {"runtime_data_prompt": payload["runtime_data_prompt"]}
+                    if "runtime_data_prompt" in payload else {})
+                return run_one_job(job, adapters=None, loop=None, verbose=False, **context_kwargs)
             finally:
                 if old_external_execution is None:
                     os.environ.pop("_HERMES_CRON_EXTERNAL_WORKER", None)
@@ -4243,7 +4265,7 @@ from cron.scheduler_script import (  # noqa: E402
     _get_session_db_timeout, _run_job_script_with_claim_heartbeat, _start_heartbeat_thread,
 )
 from cron.scheduler_prompt import (  # noqa: E402
-    _block_and_pause_job, _build_job_prompt, _guard_job_credential_exfil, _parse_wake_gate,
+    _block_and_pause_job, _build_job_prompt, _fetch_public_task_context, _guard_job_credential_exfil, _parse_wake_gate,
 )
 from cron.scheduler_preflight import (  # noqa: E402
     BLOCKED_CONFIG_MARKER, BLOCKED_CONFIG_SILENT_MARKER, _cron_preflight_enabled,
